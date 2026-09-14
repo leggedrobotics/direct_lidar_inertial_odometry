@@ -39,6 +39,9 @@
     odom/imu/bufferSize: 5000
 
     odom/preprocessing/cropBoxFilter/size: 1.0
+    # 10% NIST ranges; rings run lowest-to-highest (ring 0 = chart channel 32).
+    odom/preprocessing/ringRangeFilter/enabled: true
+    odom/preprocessing/ringRangeFilter/maxRanges: [10.0, 20.0, 20.0, 20.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
     odom/preprocessing/voxelFilter/res: 0.1
 
     odom/keyframe/threshD: 10.25

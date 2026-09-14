@@ -906,6 +906,10 @@ void dlio::OdomNode::performReset() {
         this->pc_q_.pop_front();
       }
 
+      if (gate_job.cloud_msg && !gate_job.ring_range_filtered) {
+        this->filterPointCloudByRingRange(*gate_job.cloud_msg);
+        gate_job.ring_range_filtered = true;
+      }
       if (this->scanPassesGeometryGate(gate_job.cloud_msg)) {
         RCLCPP_INFO(this->get_logger(),
                     "\033[32m[RESET] Geometry gate passed after dropping %d scan(s). "
@@ -1180,9 +1184,34 @@ void dlio::OdomNode::enqueuePointCloud(const sensor_msgs::msg::PointCloud2::Shar
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Pointcloud queue full. Dropping oldest scan.");
     }
 
-    pc_q_.push_back(PointCloudJob{pc});
+    pc_q_.push_back(PointCloudJob{pc, false});
   }
   pc_q_cv_.notify_one();
+}
+
+std::size_t dlio::OdomNode::filterPointCloudByRingRange(
+    sensor_msgs::msg::PointCloud2& pc) {
+  if (!this->ring_range_filter_enabled_ || pc.height == 0 || pc.width == 0) {
+    return 0;
+  }
+
+  const dlio::RingRangeFilterResult result =
+      dlio::filterPointCloudByRingRange(pc, this->ring_range_squared_);
+  if (!result.supported_layout) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Ring range filter requires little-endian FLOAT32 x/y/z and UINT16 ring fields; "
+        "leaving this cloud unfiltered.");
+    return 0;
+  }
+  if (!this->ring_range_filter_reported_) {
+    RCLCPP_INFO(
+        this->get_logger(),
+        "Per-ring LiDAR range filter active: input=%zu, removed=%zu, output=%zu points.",
+        result.input_points, result.removedPoints(), result.output_points);
+    this->ring_range_filter_reported_ = true;
+  }
+  return result.removedPoints();
 }
 
 void dlio::OdomNode::pointCloudWorkerLoop() {
@@ -1312,6 +1341,11 @@ void dlio::OdomNode::pointCloudWorkerLoop() {
       pc_q_.pop_front();
     }
 
+    if (job.cloud_msg && !job.ring_range_filtered) {
+      this->filterPointCloudByRingRange(*job.cloud_msg);
+      job.ring_range_filtered = true;
+    }
+
     // Wait here, before any pointcloud processing begins.
     const double required_imu_time = required_imu_time_from_cloud(job.cloud_msg);
 
@@ -1385,6 +1419,23 @@ void dlio::OdomNode::getParams() {
 
   // Crop Box Filter
   dlio::declare_param(this, "odom/preprocessing/cropBoxFilter/size", this->crop_size_, 1.0);
+
+  // Per-ring maximum range filter. The default table is indexed by the
+  // zero-based ring values used in the PointCloud2 message.
+  dlio::declare_param(this, "odom/preprocessing/ringRangeFilter/enabled",
+                      this->ring_range_filter_enabled_, false);
+  std::vector<double> ring_ranges_m;
+  dlio::declare_param(this, "odom/preprocessing/ringRangeFilter/maxRanges",
+                      ring_ranges_m, dlio::defaultRingRangesMeters());
+  try {
+    this->ring_range_squared_ = dlio::squaredRingRanges(ring_ranges_m);
+  } catch (const std::invalid_argument& error) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Invalid odom/preprocessing/ringRangeFilter/maxRanges: %s. "
+                 "Disabling ring range filtering.",
+                 error.what());
+    this->ring_range_filter_enabled_ = false;
+  }
 
   // Voxel Grid Filter
   dlio::declare_param(this, "pointcloud/voxelize", this->vf_use_, true);

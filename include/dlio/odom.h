@@ -12,6 +12,7 @@
 
 #include "dlio/dlio.h"
 #include "dlio/imu_timestamp_tracker.h"
+#include "dlio/ring_range_filter.h"
 
 // ROS
 #include "rclcpp/rclcpp.hpp"
@@ -83,6 +84,7 @@ private:
   bool triggerInternalReset(const std::string& reason);
   void requestMapReset(const std::string& origin);
   bool scanPassesGeometryGate(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
+  std::size_t filterPointCloudByRingRange(sensor_msgs::msg::PointCloud2& pc);
   bool shouldStop();
 
 void publishToROS(const pcl::PointCloud<PointType>::ConstPtr& published_cloud,
@@ -507,6 +509,10 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
 
   double crop_size_;
 
+  bool ring_range_filter_enabled_ = false;
+  bool ring_range_filter_reported_ = false;
+  std::array<float, dlio::kRingRangeCount> ring_range_squared_{};
+
   bool vf_use_;
   double vf_res_;
   int pointcloud_queue_size_;
@@ -591,6 +597,7 @@ struct PubJob {
 
   struct PointCloudJob {
     sensor_msgs::msg::PointCloud2::SharedPtr cloud_msg;
+    bool ring_range_filtered = false;
   };
 
   std::thread pointcloud_worker_;
