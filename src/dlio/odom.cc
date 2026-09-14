@@ -219,6 +219,8 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
       "markers/correction", marker_qos);
   this->pub_degen_marker_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
       "markers/degeneracy_directions", marker_qos);
+  this->degen_status_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+      "degenerate", marker_qos);
   this->corr_marker_points_.reserve(
       2U * static_cast<std::size_t>(std::max(1, this->viz_corr_max_segments_)));
 
@@ -790,6 +792,7 @@ void dlio::OdomNode::performReset() {
   this->first_scan_stamp = 0.0;
   this->prev_scan_stamp  = 0.0;
   this->scan_stamp       = 0.0;
+  this->resetPointCloudTiming();
   this->elapsed_time     = 0.0;
   this->length_traversed = 0.0;
   this->trajectory.clear();
@@ -1394,6 +1397,25 @@ void dlio::OdomNode::getParams() {
   if (this->pointcloud_queue_size_ < 1) {
     RCLCPP_WARN(this->get_logger(), "pointcloud/queueSize must be >= 1. Falling back to 1.");
     this->pointcloud_queue_size_ = 1;
+  }
+
+  // Input timing diagnostic. The default accepts a 100 ms LiDAR period with
+  // 20 ms of jitter, while preserving the incoming cloud unchanged.
+  dlio::declare_param(this, "pointcloud/timing/enabled",
+                      this->pointcloud_timing_enabled_, true);
+  dlio::declare_param(this, "pointcloud/timing/expectedPeriod",
+                      this->pointcloud_expected_period_, 0.1);
+  dlio::declare_param(this, "pointcloud/timing/tolerance",
+                      this->pointcloud_period_tolerance_, 0.02);
+  if (this->pointcloud_expected_period_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "pointcloud/timing/expectedPeriod must be > 0. Falling back to 0.1 s.");
+    this->pointcloud_expected_period_ = 0.1;
+  }
+  if (this->pointcloud_period_tolerance_ < 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "pointcloud/timing/tolerance must be >= 0. Falling back to 0.02 s.");
+    this->pointcloud_period_tolerance_ = 0.02;
   }
 
   // Gravity
@@ -2408,6 +2430,8 @@ void dlio::OdomNode::initializeDLIO() {
 // ROS 2 Jazzy subscription callbacks accept SharedPtr by value; const ref is not a supported callback signature here.
 // NOLINTNEXTLINE(performance-unnecessary-value-param)
 void dlio::OdomNode::callbackPointCloud(sensor_msgs::msg::PointCloud2::SharedPtr pc) {
+  this->checkPointCloudTiming(pc);
+
   // Keep callback lightweight to avoid blocking DDS receive threads.
   this->enqueuePointCloud(pc);
 
@@ -2434,6 +2458,52 @@ void dlio::OdomNode::callbackPointCloud(sensor_msgs::msg::PointCloud2::SharedPtr
       }
     }
   }
+}
+
+void dlio::OdomNode::checkPointCloudTiming(
+    const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
+  if (!this->pointcloud_timing_enabled_ || !pc) {
+    return;
+  }
+
+  const std::int64_t stamp_ns = rclcpp::Time(pc->header.stamp).nanoseconds();
+  std::lock_guard<std::mutex> lock(this->pointcloud_timing_mutex_);
+
+  if (!this->pointcloud_timing_has_previous_) {
+    this->pointcloud_previous_stamp_ns_ = stamp_ns;
+    this->pointcloud_timing_has_previous_ = true;
+    return;
+  }
+
+  const double period = static_cast<double>(stamp_ns - this->pointcloud_previous_stamp_ns_) / 1e9;
+  const double lower_bound = this->pointcloud_expected_period_ - this->pointcloud_period_tolerance_;
+  const double upper_bound = this->pointcloud_expected_period_ + this->pointcloud_period_tolerance_;
+  const bool unexpected_period = period < lower_bound || period > upper_bound;
+
+  if (unexpected_period) {
+    const char* classification = period <= 0.0 ? "non-increasing" :
+        (period > upper_bound ? "delayed" : "too fast");
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "\033[31m[POINTCLOUD TIMING] %s header interval: %.3f ms "
+        "(expected %.3f +/- %.3f ms); previous=%.9f, current=%.9f\033[0m",
+        classification,
+        period * 1e3,
+        this->pointcloud_expected_period_ * 1e3,
+        this->pointcloud_period_tolerance_ * 1e3,
+        static_cast<double>(this->pointcloud_previous_stamp_ns_) / 1e9,
+        static_cast<double>(stamp_ns) / 1e9);
+  }
+
+  // Advance on every sample so a single late/early cloud does not cause all
+  // subsequent warnings to be measured against an old header.
+  this->pointcloud_previous_stamp_ns_ = stamp_ns;
+}
+
+void dlio::OdomNode::resetPointCloudTiming() {
+  std::lock_guard<std::mutex> lock(this->pointcloud_timing_mutex_);
+  this->pointcloud_timing_has_previous_ = false;
+  this->pointcloud_previous_stamp_ns_ = 0;
 }
 
 void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
@@ -2501,6 +2571,7 @@ void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::Shar
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
     this->initializeInputTarget();
+    this->publishDegeneracyStatus(false);
     State initial_scan_state;
     {
       std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
@@ -3181,6 +3252,16 @@ void dlio::OdomNode::publishDegeneracyMarkers(const rclcpp::Time& stamp) {
   }
 }
 
+void dlio::OdomNode::publishDegeneracyStatus(const bool degenerate) {
+  if (!hasSubscribers(this->degen_status_pub_)) {
+    return;
+  }
+
+  std_msgs::msg::Bool status;
+  status.data = degenerate;
+  this->degen_status_pub_->publish(status);
+}
+
 void dlio::OdomNode::createCorrectionMarker(
     const std::string& frame_id,
     const rclcpp::Time& stamp,
@@ -3428,6 +3509,8 @@ bool dlio::OdomNode::getNextPose() {
   } else {
     this->degen_consecutive_hits_ = 0;
   }
+
+  this->publishDegeneracyStatus(live_degenerate);
 
   // Start with nearest-neighbor rematching. If a well-constrained scan produces
   // an oversized correction, latch fixed trial correspondences. Once weak

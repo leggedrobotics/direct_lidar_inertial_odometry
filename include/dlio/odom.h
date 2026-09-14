@@ -23,6 +23,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -70,6 +71,8 @@ private:
   void getParams();
 
   void callbackPointCloud(sensor_msgs::msg::PointCloud2::SharedPtr pc);  // NOLINT(performance-unnecessary-value-param)
+  void checkPointCloudTiming(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
+  void resetPointCloudTiming();
   void processPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
   void callbackImu(sensor_msgs::msg::Imu::SharedPtr imu);  // NOLINT(performance-unnecessary-value-param)
   void resetService(std::shared_ptr<std_srvs::srv::Trigger::Request> req,  // NOLINT(performance-unnecessary-value-param)
@@ -167,6 +170,7 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   void analyzeDegeneracyFromCurrentScan(const Eigen::Ref<const Eigen::Matrix4f>& T_map_base);
 
   void publishDegeneracyMarkers(const rclcpp::Time& stamp);
+  void publishDegeneracyStatus(bool degenerate);
   void createLinVelocityMarker(const std::string& frame_id, const rclcpp::Time& stamp,
                                const Eigen::Vector3f& v_b,
                                visualization_msgs::msg::Marker& out);
@@ -208,6 +212,7 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_ang_vel_marker_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_corr_marker_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_degen_marker_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr degen_status_pub_;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
@@ -516,6 +521,12 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   bool vf_use_;
   double vf_res_;
   int pointcloud_queue_size_;
+  bool pointcloud_timing_enabled_ = true;
+  double pointcloud_expected_period_ = 0.1;
+  double pointcloud_period_tolerance_ = 0.02;
+  std::mutex pointcloud_timing_mutex_;
+  bool pointcloud_timing_has_previous_ = false;
+  std::int64_t pointcloud_previous_stamp_ns_ = 0;
 
   bool imu_calibrate_;
   bool calibrate_gyro_;

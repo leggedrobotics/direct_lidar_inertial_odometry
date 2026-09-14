@@ -32,6 +32,11 @@
     odom/gravity: 9.80665
     odom/computeTimeOffset: false
 
+    # Input header timing diagnostic: default is 100 ms +/- 20 ms.
+    pointcloud/timing/enabled: true
+    pointcloud/timing/expectedPeriod: 0.1
+    pointcloud/timing/tolerance: 0.02
+
     odom/imu/approximateGravity: true
     odom/imu/calibration/gyro: true
     odom/imu/calibration/accel: true

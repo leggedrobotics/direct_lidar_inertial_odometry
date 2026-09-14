@@ -54,6 +54,7 @@ def generate_launch_description():
             ('markers/velocity_angular', 'dlio/odom_node/markers/velocity_angular'),
             ('markers/correction', 'dlio/odom_node/markers/correction'),
             ('markers/degeneracy_directions', 'dlio/odom_node/markers/degeneracy_directions'),
+            ('degenerate', 'dlio/odom_node/degenerate'),
         ],
         respawn=True,
     )
