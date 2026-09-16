@@ -25,6 +25,13 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(tf2_ros REQUIRED)
+# CZ and Claude: G1 body filter node
+find_package(tf2 REQUIRED)
+find_package(tf2_eigen REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(urdf REQUIRED)
+# end of CZ and Claude
 
 # --- 3rd party ---
 find_package(PCL REQUIRED)
@@ -98,6 +105,15 @@ ament_target_dependencies(dlio_map_node
   tf2_ros pcl_ros pcl_conversions rclcpp
 )
 
+# CZ and Claude: G1 self-filter (replaces the ROS 1 sensor_filters + robot_body_filter chain)
+add_executable(g1_body_filter_node
+  src/body_filter/g1_body_filter_node.cc
+)
+ament_target_dependencies(g1_body_filter_node
+  rclcpp sensor_msgs geometry_msgs visualization_msgs tf2 tf2_ros tf2_eigen urdf
+)
+# end of CZ and Claude
+
 # --- Export & install headers ---
 ament_export_include_directories(include)
 install(DIRECTORY include/
@@ -121,7 +137,7 @@ ament_export_dependencies(
 )
 
 # --- Install binaries ---
-install(TARGETS dlio_odom_node dlio_map_node
+install(TARGETS dlio_odom_node dlio_map_node g1_body_filter_node
         DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY cfg launch

@@ -1,0 +1,30 @@
+# CZ and Claude: G1 self-filter for the DLIO deskewed cloud (ROS 2 port of the
+# robot_body_filter/RobotBodyFilterPointCloud2 configuration; see src/body_filter/g1_body_filter_node.cc).
+# Removes points on/near (<= 6 cm) the robot's own body links; cloud stays in robot/odom frame.
+# The body model is g1_description/g1_29dof_body_filter.urdf (AABB boxes + spheres), passed by the
+# launch file as `urdf_path`. Link poses are looked up in TF at the cloud stamp (needs base_odom
+# running for the full-body TF), so the filter node needs the same TF tree as robot_body_filter did.
+/**:
+  ros__parameters:
+    # contains-test only: do_clipping=false, do_shadow_test=false (raycasting off -> major CPU saving)
+    inflation_scale: 1.0
+    inflation_padding: 0.06          # dilation: points near the body also removed
+    only_links: [torso_link, head_link,
+                 left_shoulder_pitch_link, left_shoulder_roll_link, left_shoulder_yaw_link,
+                 right_shoulder_pitch_link, right_shoulder_roll_link, right_shoulder_yaw_link,
+                 left_elbow_link, right_elbow_link,
+                 left_wrist_roll_link, left_wrist_pitch_link, left_wrist_yaw_link,
+                 right_wrist_roll_link, right_wrist_pitch_link, right_wrist_yaw_link,
+                 left_rubber_hand, right_rubber_hand,   # 5cm ball collision in body-filter URDF
+                 left_knee_link, right_knee_link,
+                 left_ankle_roll_link, right_ankle_roll_link,
+                 livox_frame]   # crop box in sensor frame: drops -1<x<0.2, -1<y<1, -1<z<1
+    # exact bounds for the crop box: no inflation on livox_frame
+    per_link_padding_links: [livox_frame]
+    per_link_padding_values: [0.0]
+    per_link_scale_links: [livox_frame]
+    per_link_scale_values: [1.0]
+    # visualize the filter body model (inflated contains-test shapes) as a MarkerArray on
+    # <node>/robot_model_for_contains_test; view in RViz with a MarkerArray display.
+    debug_markers: true
+    tf_timeout: 0.2

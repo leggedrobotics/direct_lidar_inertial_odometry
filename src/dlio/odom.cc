@@ -92,6 +92,10 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node")
   this->original_scan = std::make_shared<const pcl::PointCloud<PointType>>();
   this->deskewed_scan = std::make_shared<const pcl::PointCloud<PointType>>();
   this->current_scan = std::make_shared<const pcl::PointCloud<PointType>>();
+  // CZ and Claude
+  this->original_scan_full = std::make_shared<const pcl::PointCloud<PointType>>();
+  this->deskewed_scan_full = std::make_shared<const pcl::PointCloud<PointType>>();
+  // end of CZ and Claude
   this->submap_cloud = std::make_shared<const pcl::PointCloud<PointType>>();
 
   this->num_processed_keyframes = 0;
@@ -545,8 +549,11 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   pcl::removeNaNFromPointCloud(*original_scan_, *original_scan_, idx);
 
   // Crop Box Filter
+  // CZ and Claude: crop into a separate cloud; keep the full NaN-free scan for deskewing/publishing
+  pcl::PointCloud<PointType>::Ptr original_scan_cropped_ = std::make_shared<pcl::PointCloud<PointType>>();
   this->crop.setInputCloud(original_scan_);
-  this->crop.filter(*original_scan_);
+  this->crop.filter(*original_scan_cropped_);
+  // end of CZ and Claude
 
   // automatically detect sensor type
   this->sensor = dlio::SensorType::UNKNOWN;
@@ -580,7 +587,10 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   }
 
   this->scan_header_stamp = pc->header.stamp;
-  this->original_scan = original_scan_;
+  // CZ and Claude: original_scan stays cropped (computeSpaciousness / adaptive params unchanged)
+  this->original_scan = original_scan_cropped_;
+  this->original_scan_full = original_scan_;
+  // end of CZ and Claude
 }
 
 void dlio::OdomNode::preprocessPoints()
@@ -636,6 +646,12 @@ void dlio::OdomNode::preprocessPoints()
     pcl::transformPointCloud(*this->original_scan, *deskewed_scan_,
                              this->T_prior * this->extrinsics.baselink2lidar_T);
     this->deskewed_scan = deskewed_scan_;
+    // CZ and Claude: also transform the full (uncropped) scan for publishing
+    pcl::PointCloud<PointType>::Ptr deskewed_scan_full_ = std::make_shared<pcl::PointCloud<PointType>>();
+    pcl::transformPointCloud(*this->original_scan_full, *deskewed_scan_full_,
+                             this->T_prior * this->extrinsics.baselink2lidar_T);
+    this->deskewed_scan_full = deskewed_scan_full_;
+    // end of CZ and Claude
     this->deskew_status = false;
   }
 
@@ -656,8 +672,9 @@ void dlio::OdomNode::preprocessPoints()
 void dlio::OdomNode::deskewPointcloud()
 {
 
-  pcl::PointCloud<PointType>::Ptr deskewed_scan_ = std::make_shared<pcl::PointCloud<PointType>>(1, this->original_scan->points.size());
-  // deskewed_scan_->points.resize(this->original_scan->points.size());
+  // CZ and Claude: deskew the full (uncropped) scan
+  pcl::PointCloud<PointType>::Ptr deskewed_scan_ = std::make_shared<pcl::PointCloud<PointType>>(1, this->original_scan_full->points.size());
+  // end of CZ and Claude
   // individual point timestamps should be relative to this time
   double sweep_ref_time = rclcpp::Time(this->scan_header_stamp).seconds();
 
@@ -713,8 +730,17 @@ void dlio::OdomNode::deskewPointcloud()
   }
 
   // copy points into deskewed_scan_ in order of timestamp
-  std::partial_sort_copy(this->original_scan->points.begin(), this->original_scan->points.end(),
+  // CZ and Claude: sort the full scan; note this adds in-box-only timestamps, so the median
+  // scan_stamp and integrateImu queries shift sub-millisecond vs. stock DLIO (harmless)
+  std::partial_sort_copy(this->original_scan_full->points.begin(), this->original_scan_full->points.end(),
                          deskewed_scan_->points.begin(), deskewed_scan_->points.end(), point_time_cmp);
+
+  // indices of points OUTSIDE the crop box (crop has setNegative(true)), computed in the sensor
+  // frame; all transforms below are in-place and order-preserving, so these stay valid
+  std::vector<int> keep_indices;
+  this->crop.setInputCloud(deskewed_scan_);
+  this->crop.filter(keep_indices);
+  // end of CZ and Claude
 
   // filter unique timestamps
   auto points_unique_timestamps = deskewed_scan_->points | boost::adaptors::indexed() | boost::adaptors::adjacent_filtered(point_time_neq);
@@ -752,7 +778,7 @@ void dlio::OdomNode::deskewPointcloud()
     this->first_valid_scan = true;
     this->T_prior = this->T; // assume no motion for the first scan
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
-    this->deskewed_scan = deskewed_scan_;
+    this->splitDeskewedScan(deskewed_scan_, keep_indices); // CZ and Claude
     this->deskew_status = true;
     return;
   }
@@ -771,7 +797,7 @@ void dlio::OdomNode::deskewPointcloud()
 
     this->T_prior = this->T;
     pcl::transformPointCloud(*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
-    this->deskewed_scan = deskewed_scan_;
+    this->splitDeskewedScan(deskewed_scan_, keep_indices); // CZ and Claude
     this->deskew_status = false;
     return;
   }
@@ -794,9 +820,20 @@ void dlio::OdomNode::deskewPointcloud()
     }
   }
 
-  this->deskewed_scan = deskewed_scan_;
+  this->splitDeskewedScan(deskewed_scan_, keep_indices); // CZ and Claude
   this->deskew_status = true;
 }
+
+// CZ and Claude: split fully-deskewed cloud: cropped subset -> odometry, full -> publishing
+void dlio::OdomNode::splitDeskewedScan(const pcl::PointCloud<PointType>::Ptr& full_scan,
+                                       const std::vector<int>& keep_indices)
+{
+  pcl::PointCloud<PointType>::Ptr cropped_ = std::make_shared<pcl::PointCloud<PointType>>();
+  pcl::copyPointCloud(*full_scan, keep_indices, *cropped_);
+  this->deskewed_scan = cropped_;       // same semantics as before (in-box points excluded)
+  this->deskewed_scan_full = full_scan; // all points, for the deskewed topic
+}
+// end of CZ and Claude
 
 void dlio::OdomNode::initializeInputTarget()
 {
@@ -948,11 +985,11 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   pcl::PointCloud<PointType>::ConstPtr published_cloud;
   if (this->densemap_filtered_)
   {
-    published_cloud = this->current_scan;
+    published_cloud = this->current_scan; // CZ and Claude: intentionally still cropped+voxelized
   }
   else
   {
-    published_cloud = this->deskewed_scan;
+    published_cloud = this->deskewed_scan_full; // CZ and Claude: publish crop-box points too
   }
   RCLCPP_INFO_THROTTLE(
       this->get_logger(),

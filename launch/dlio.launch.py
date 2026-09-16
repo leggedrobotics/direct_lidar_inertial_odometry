@@ -1,4 +1,5 @@
 from launch import LaunchDescription
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
@@ -15,6 +16,8 @@ def generate_launch_description():
     baselink_frame = LaunchConfiguration('baselink_frame', default='robot/base_link')
     lidar_frame = LaunchConfiguration('lidar_frame', default='robot/lidar')
     imu_frame = LaunchConfiguration('imu_frame', default='robot/imu')
+    self_filter = LaunchConfiguration('self_filter')
+    body_filter_urdf = LaunchConfiguration('body_filter_urdf')
 
     declare_robot_namespace_arg = DeclareLaunchArgument(
         'robot_namespace',
@@ -51,10 +54,23 @@ def generate_launch_description():
         default_value='robot/imu',
         description='Internal IMU frame id published by DLIO'
     )
+    # CZ and Claude: G1 self-filter (see cfg/body_filter.yaml)
+    declare_self_filter_arg = DeclareLaunchArgument(
+        'self_filter',
+        default_value='true',
+        description='Run the G1 body filter on the deskewed cloud -> .../pointcloud/deskewed_self_filtered'
+    )
+    declare_body_filter_urdf_arg = DeclareLaunchArgument(
+        'body_filter_urdf',
+        default_value=PathJoinSubstitution([FindPackageShare("g1_description"), "g1_29dof_body_filter.urdf"]),
+        description='Dedicated URDF whose collisions are AABB boxes / spheres (fast contains-tests)'
+    )
+    # end of CZ and Claude
 
     # Load DLIO parameters
     dlio_yaml_path = PathJoinSubstitution([current_pkg, "cfg", "dlio.yaml"])
     dlio_params_yaml_path = PathJoinSubstitution([current_pkg, "cfg", "params.yaml"])
+    body_filter_yaml_path = PathJoinSubstitution([current_pkg, "cfg", "body_filter.yaml"])
 
     # DLIO Odometry Node
     dlio_odom_node = Node(
@@ -108,6 +124,28 @@ def generate_launch_description():
         respawn=True,
     )
 
+    # CZ and Claude: G1 self-filter: removes robot-body points (+dilation) from the deskewed cloud.
+    # Requires base_odom.launch.py running (full-body TF). Uses a dedicated URDF whose collisions are
+    # AABB boxes (fast contains-tests); queue size 1 so a lagging filter never builds a backlog.
+    body_filter_node = Node(
+        package="direct_lidar_inertial_odometry",
+        executable="g1_body_filter_node",
+        name="body_filter",
+        namespace=robot_namespace,
+        output="screen",
+        parameters=[
+            body_filter_yaml_path,
+            {"urdf_path": body_filter_urdf},
+        ],
+        remappings=[
+            ("input", "dlio/odom_node/pointcloud/deskewed"),
+            ("output", "dlio/odom_node/pointcloud/deskewed_self_filtered"),
+        ],
+        condition=IfCondition(self_filter),
+        respawn=True,
+    )
+    # end of CZ and Claude
+
     return LaunchDescription([
         # 1) Arguments
         declare_robot_namespace_arg,
@@ -117,7 +155,10 @@ def generate_launch_description():
         declare_baselink_frame_arg,
         declare_lidar_frame_arg,
         declare_imu_frame_arg,
+        declare_self_filter_arg,
+        declare_body_filter_urdf_arg,
         # 2) Nodes
         dlio_odom_node,
         dlio_map_node,
+        body_filter_node,
     ])
