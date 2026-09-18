@@ -43,6 +43,8 @@
     odom/imu/calibration/time: 3.0
     odom/imu/bufferSize: 5000
 
+    odom/deskew/maxLookback: 0.5
+
     odom/preprocessing/cropBoxFilter/size: 1.0
     # 10% NIST ranges; rings run lowest-to-highest (ring 0 = chart channel 32).
     odom/preprocessing/ringRangeFilter/enabled: true
@@ -68,10 +70,14 @@
     odom/gicp/freezeTrialTriggerTranslation: 0.10
     odom/gicp/degeneracy/enabled: true
     odom/gicp/degeneracy/trans_eig_abs_threshold: 100.0
-    odom/gicp/degeneracy/reset_consecutive_count: 0
+    odom/gicp/degeneracy/recovery_time: 3.0
+    odom/gicp/degeneracy/max_linear_speed: 8.0
+    odom/gicp/degeneracy/max_angular_speed: 4.0
+    odom/gicp/degeneracy/max_accel_bias: 5.0
+    odom/gicp/degeneracy/max_gyro_bias: 0.5
 
     odom/restart/geometry_gate/enabled: true
-    odom/restart/geometry_gate/min_eigenvalue: 100.0
+    odom/restart/geometry_gate/min_eigenvalue: 250.0
 
     # Aggressive (wn=3.0, zeta=0.85): Kp=5.1, Kv=9.0, Kq=12.0, Kab=3.0, Kgb=1.5
     odom/geo/Kp: 5.1

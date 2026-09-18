@@ -28,6 +28,28 @@ inline bool hasSubscribers(const PublisherPtrT& pub) {
   return pub && pub->get_subscription_count() > 0;
 }
 
+// Minimal scope guard so every early return out of processPointCloud() still
+// runs the scan-timestamp bookkeeping. prev_scan_stamp must advance once per
+// consumed scan; if any exit path forgets it, the next scan asks integrateImu()
+// for an ever-growing interval that eventually falls out of the IMU ring buffer
+// and can never recover.
+template <typename F>
+class ScopeExit {
+ public:
+  explicit ScopeExit(F fn) : fn_(std::move(fn)) {}
+  ~ScopeExit() { fn_(); }
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+
+ private:
+  F fn_;
+};
+
+template <typename F>
+ScopeExit<F> makeScopeExit(F fn) {
+  return ScopeExit<F>(std::move(fn));
+}
+
 struct NormalScatterStats {
   Eigen::Matrix3d scatter = Eigen::Matrix3d::Zero();
   int valid_normals = 0;
@@ -834,6 +856,7 @@ void dlio::OdomNode::performReset() {
   this->corr_marker_points_.clear();
   this->degen_info_.valid              = false;
   this->degen_consecutive_hits_        = 0;
+  this->degen_recovery_start_stamp_    = 0.0;
   this->gicp_freeze_trials_latched_    = false;
   this->gicp_rematch_trials_latched_   = false;
   this->degen_prev_dirs_initialized_   = false;
@@ -939,6 +962,7 @@ void dlio::OdomNode::performReset() {
   // -----------------------------------------------------------------------
   // Signal completion to the waiting service thread.
   // -----------------------------------------------------------------------
+  this->estimator_halted_.store(false);
   RCLCPP_INFO(this->get_logger(),
               "\033[32m[RESET] ============ ODOM RESET COMPLETE ============\033[0m");
   this->finishPendingReset(true, "Odom reset complete.");
@@ -947,16 +971,22 @@ void dlio::OdomNode::performReset() {
 bool dlio::OdomNode::scanPassesGeometryGate(
     const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
 
-  this->gicp_self_.setRegularizationMethod(nano_gicp::RegularizationMethod::NONE);
-  const auto restore_regularization = [this]() {
-    this->gicp_self_.setRegularizationMethod(nano_gicp::RegularizationMethod::PLANE);
-  };
-
+  // The gate and analyzeDegeneracyFromCurrentScan() feed the same
+  // buildNormalScatterMatrix() and compare its smallest eigenvalue against a
+  // threshold, so both must weight points the same way or the two thresholds
+  // are in different units. The detector runs on this->gicp, which is never
+  // configured and therefore uses nano_gicp's default PLANE. PLANE replaces
+  // every point covariance with singular values (1, 1, 1e-3), so each point
+  // contributes a full unit vote; NONE keeps the raw sample covariance, whose
+  // planarity weight averaged 0.39 on the hiking2025 data. Running the gate
+  // with NONE made restart_gate_min_eigenvalue ~2.5x stricter than the
+  // detector that had just declared the scene recovered, which stalled one
+  // restart for 787 scans (~79 s). Match the detector.
+  this->gicp_self_.setRegularizationMethod(nano_gicp::RegularizationMethod::PLANE);
 
   pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
   pcl::fromROSMsg(*pc, *cloud);
   if (cloud->empty()) {
-    restore_regularization();
     return false;
   }
 
@@ -982,21 +1012,18 @@ bool dlio::OdomNode::scanPassesGeometryGate(
     RCLCPP_WARN(this->get_logger(),
                 "[GATE] Scan has only %zu points after filtering (min %d) — dropped.",
                 cloud->size(), this->gicp_min_num_points_);
-    restore_regularization();
     return false;
   }
 
   this->gicp_self_.setInputSource(cloud);
   if (!this->gicp_self_.calculateSourceCovariances()) {
     RCLCPP_WARN(this->get_logger(), "[GATE] Covariance computation failed — scan dropped.");
-    restore_regularization();
     return false;
   }
 
   const auto covs = this->gicp_self_.getSourceCovariances();
   if (!covs || covs->size() != cloud->size()) {
     RCLCPP_WARN(this->get_logger(), "[GATE] Covariance cache is invalid — scan dropped.");
-    restore_regularization();
     return false;
   }
 
@@ -1008,14 +1035,12 @@ bool dlio::OdomNode::scanPassesGeometryGate(
     RCLCPP_WARN(this->get_logger(),
                 "[GATE] Normal diversity is ill-defined (valid_normals=%d, total_weight=%.1f) — scan dropped.",
                 normal_stats.valid_normals, normal_stats.total_weight);
-    restore_regularization();
     return false;
   }
 
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(normal_stats.scatter);
   if (eig.info() != Eigen::Success) {
     RCLCPP_WARN(this->get_logger(), "[GATE] Normal-scatter eigendecomposition failed — scan dropped.");
-    restore_regularization();
     return false;
   }
 
@@ -1034,9 +1059,252 @@ bool dlio::OdomNode::scanPassesGeometryGate(
               min_eval, this->restart_gate_min_eigenvalue_,
               passes ? "\033[32mPASS\033[0m" : "\033[31mFAIL\033[0m");
 
-  restore_regularization();
 
   return passes;
+}
+
+bool dlio::OdomNode::stateExceedsDegeneracyBounds(
+    const State& candidate,
+    std::string& reason) const {
+  if (!candidate.p.allFinite() ||
+      !candidate.q.coeffs().allFinite() ||
+      candidate.q.norm() <= 1e-6f ||
+      !candidate.v.lin.w.allFinite() ||
+      !candidate.v.ang.b.allFinite() ||
+      !candidate.v.ang.w.allFinite() ||
+      !candidate.b.accel.allFinite() ||
+      !candidate.b.gyro.allFinite()) {
+    reason = "state contains a non-finite position, attitude, velocity, or bias";
+    return true;
+  }
+
+  const double linear_speed = static_cast<double>(candidate.v.lin.w.norm());
+  const double angular_speed = std::max(
+      static_cast<double>(candidate.v.ang.b.norm()),
+      static_cast<double>(candidate.v.ang.w.norm()));
+  const double accel_bias = static_cast<double>(candidate.b.accel.cwiseAbs().maxCoeff());
+  const double gyro_bias = static_cast<double>(candidate.b.gyro.cwiseAbs().maxCoeff());
+
+  if (linear_speed >= this->degen_max_linear_speed_) {
+    reason = "linear speed " + std::to_string(linear_speed) +
+             " m/s reached/exceeds " + std::to_string(this->degen_max_linear_speed_) + " m/s";
+    return true;
+  }
+  if (angular_speed >= this->degen_max_angular_speed_) {
+    reason = "angular speed " + std::to_string(angular_speed) +
+             " rad/s reached/exceeds " + std::to_string(this->degen_max_angular_speed_) + " rad/s";
+    return true;
+  }
+  if (accel_bias >= this->degen_max_accel_bias_) {
+    reason = "absolute accelerometer bias " + std::to_string(accel_bias) +
+             " m/s^2 reached/exceeds " + std::to_string(this->degen_max_accel_bias_) + " m/s^2";
+    return true;
+  }
+  if (gyro_bias >= this->degen_max_gyro_bias_) {
+    reason = "absolute gyroscope bias " + std::to_string(gyro_bias) +
+             " rad/s reached/exceeds " + std::to_string(this->degen_max_gyro_bias_) + " rad/s";
+    return true;
+  }
+
+  return false;
+}
+
+// Scene-only degeneracy: does this scan constrain translation in all three
+// directions? Depends purely on the current scan, so it keeps re-evaluating
+// while the estimator is halted.
+bool dlio::OdomNode::currentScanGeometryIsDegenerate(std::string& reason) const {
+  if (!this->use_degeneracy_) {
+    return false;
+  }
+
+  if (!this->degen_info_.valid) {
+    reason = "scan degeneracy analysis is invalid";
+    return true;
+  }
+
+  if (hasWeakDirection(this->degen_info_.weak_trans)) {
+    reason = "scan normal-spread spectrum has a weak translation direction";
+    return true;
+  }
+
+  return false;
+}
+
+bool dlio::OdomNode::currentScanIsDegenerate(
+    const State& candidate,
+    std::string& reason) const {
+  if (this->currentScanGeometryIsDegenerate(reason)) {
+    return true;
+  }
+  if (!this->use_degeneracy_) {
+    return false;
+  }
+
+  return this->stateExceedsDegeneracyBounds(candidate, reason);
+}
+
+void dlio::OdomNode::enterDegenerateHalt(const std::string& reason) {
+  const bool was_halted = this->estimator_halted_.exchange(true);
+
+  // Do not allow jobs already computed before the halt to publish stale poses.
+  {
+    std::lock_guard<std::mutex> lock(this->q_mtx_);
+    this->q_.clear();
+  }
+  this->q_cv_.notify_all();
+
+  if (!was_halted) {
+    RCLCPP_ERROR(
+        this->get_logger(),
+        "\033[1;31m[DEGEN] Estimator halted; pose/TF publication disabled: %s\033[0m",
+        reason.c_str());
+  }
+}
+
+// Advance the deskew anchor to the scan that was just consumed. Monotonic and
+// idempotent, so it is safe to call from a scope guard on top of the explicit
+// assignments already made by initializeInputTarget() and processPointCloud().
+void dlio::OdomNode::advancePrevScanStamp() {
+  if (!this->first_valid_scan) {
+    // performReset() clears prev_scan_stamp/scan_stamp on purpose; the
+    // re-initialisation path owns the first post-reset stamp.
+    return;
+  }
+  if (!std::isfinite(this->scan_stamp) || this->scan_stamp <= 0.0) {
+    return;
+  }
+  if (this->scan_stamp > this->prev_scan_stamp) {
+    this->prev_scan_stamp = this->scan_stamp;
+  }
+}
+
+// Oldest measurement still held by the IMU ring buffer, or -1 when empty.
+// integrateImu() cannot serve a start time older than this.
+double dlio::OdomNode::oldestImuStamp() {
+  std::lock_guard<decltype(this->mtx_imu)> lock(this->mtx_imu);
+  if (this->imu_buffer.empty()) {
+    return -1.0;
+  }
+  return this->imu_buffer.back().stamp;
+}
+
+void dlio::OdomNode::processHaltedScan(
+    const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
+  if (!pc || !this->use_degeneracy_) {
+    return;
+  }
+
+  // Continue evaluating incoming scans without running GICP or publishing.
+  // getScanFromROS()/preprocessPoints() also provide the same scan-time IMU
+  // prior used by the normal estimator, so speed checks remain live while the
+  // estimator is halted.
+  this->getScanFromROS(pc);
+  if (!this->original_scan || this->original_scan->empty()) {
+    return;
+  }
+
+  // A halted estimator must not call preprocessPoints() here. That path runs
+  // full per-point deskew using prev_scan_stamp. If getNextPose() halted the
+  // estimator, prev_scan_stamp is intentionally the last accepted scan and
+  // can be far behind the current bag time; repeatedly trying that interval
+  // would produce the same deskew failure for every recovery scan.
+  //
+  // For the health check, a rigidly transformed, non-deskewed cloud is enough:
+  // normal-spread degeneracy is invariant to the missing per-point motion
+  // compensation, and no estimator state is advanced while halted.
+  this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
+  this->T_prior = this->T;
+  auto halted_scan = std::make_shared<pcl::PointCloud<PointType>>();
+  pcl::transformPointCloud(
+      *this->original_scan, *halted_scan,
+      this->T * this->extrinsics.baselink2lidar_T);
+  this->deskewed_scan = halted_scan;
+  this->deskew_status = false;
+  this->deskew_size = 0;
+
+  if (this->vf_use_) {
+    auto filtered_scan = std::make_shared<pcl::PointCloud<PointType>>();
+    this->voxel.setInputCloud(halted_scan);
+    this->voxel.filter(*filtered_scan);
+    this->current_scan = filtered_scan;
+  } else {
+    this->current_scan = halted_scan;
+  }
+
+  // Keep the deskew anchor moving even while the estimator is stopped, so the
+  // first scan accepted after a restart asks for a one-period IMU interval
+  // rather than the whole halt. performReset() clears it before that scan.
+  if (this->scan_stamp > this->prev_scan_stamp) {
+    this->prev_scan_stamp = this->scan_stamp;
+  }
+
+  if (!this->current_scan ||
+      static_cast<int>(this->current_scan->points.size()) <= this->gicp_min_num_points_) {
+    this->degen_recovery_start_stamp_ = 0.0;
+    return;
+  }
+
+  this->setInputSource();
+  this->analyzeDegeneracyFromCurrentScan(this->T_prior);
+  this->publishDegeneracyMarkers(this->scan_header_stamp);
+
+  // Recovery is gated on scan geometry ONLY, never on the state bounds.
+  // IMU propagation and the observer are both stopped while halted, so
+  // this->state is frozen at whatever value triggered the halt. If the halt
+  // came from a state bound (speed/bias), testing that frozen value here can
+  // never pass: it reports the identical number for every subsequent scan and
+  // the estimator stays halted forever. Observed as 659 consecutive
+  // "linear speed 10.496372 m/s" holds on the hiking2025 bag.
+  // The state does not need defending here anyway -- performReset() discards
+  // it and restores the IMU baseline, and the geometry gate then decides
+  // which scan restarts the estimator.
+  std::string reason;
+  const bool degenerate = this->currentScanGeometryIsDegenerate(reason);
+
+  this->publishDegeneracyStatus(degenerate);
+  if (degenerate) {
+    this->degen_recovery_start_stamp_ = 0.0;
+    ++this->degen_consecutive_hits_;
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "[DEGEN] Recovery hold reset by scan at %.9f: %s",
+        this->scan_stamp, reason.c_str());
+    return;
+  }
+
+  this->degen_consecutive_hits_ = 0;
+  if (this->degen_recovery_start_stamp_ <= 0.0) {
+    this->degen_recovery_start_stamp_ = this->scan_stamp;
+    RCLCPP_INFO(
+        this->get_logger(),
+        "[DEGEN] Non-degenerate recovery window started at %.9f; requiring %.3f s.",
+        this->degen_recovery_start_stamp_, this->degen_recovery_time_);
+  }
+
+  const double stable_duration = this->scan_stamp - this->degen_recovery_start_stamp_;
+  if (stable_duration < this->degen_recovery_time_) {
+    return;
+  }
+
+  // performReset() owns the restart boundary and its geometry gate. Requeue
+  // this healthy scan so the gate can consume it and normal processing resumes
+  // only after reset completion.
+  {
+    std::lock_guard<std::mutex> lock(this->pc_q_mtx_);
+    this->pc_q_.push_front(PointCloudJob{pc, true});
+  }
+  this->pc_q_cv_.notify_one();
+
+  RCLCPP_INFO(
+      this->get_logger(),
+      "[DEGEN] %.3f s without degeneracy detected. Attempting estimator restart.",
+      stable_duration);
+  if (!this->triggerInternalReset("degeneracy cleared for the configured recovery window")) {
+    std::lock_guard<std::mutex> lock(this->pc_q_mtx_);
+    if (!this->pc_q_.empty() && this->pc_q_.front().cloud_msg == pc) {
+      this->pc_q_.pop_front();
+    }
+  }
 }
 
 void dlio::OdomNode::resetService(
@@ -1136,6 +1404,10 @@ void dlio::OdomNode::enqueuePublish(
     const Eigen::Vector3f& state_vlin_b_scan,
     const Eigen::Vector3f& state_vang_b_scan) {
 
+  if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   PubJob job;
   job.cloud = std::move(cloud);
   job.T_cloud = T_cloud;
@@ -1151,7 +1423,9 @@ void dlio::OdomNode::enqueuePublish(
 
   {
     std::lock_guard<std::mutex> lk(q_mtx_);
-    q_.push_back(std::move(job));
+    if (!this->estimator_halted_.load(std::memory_order_relaxed)) {
+      q_.push_back(std::move(job));
+    }
   }
   q_cv_.notify_one();
 }
@@ -1165,6 +1439,10 @@ void dlio::OdomNode::workerLoop() {
       if (this->shouldStop()) break;
       job = std::move(q_.front());
       q_.pop_front();
+    }
+
+    if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+      continue;
     }
 
     publishToROS(job.cloud,
@@ -1509,6 +1787,7 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/imu/calibration/gyro", this->calibrate_gyro_, true);
   dlio::declare_param(this, "odom/imu/calibration/time", this->imu_calib_time_, 3.0);
   dlio::declare_param(this, "odom/imu/bufferSize", this->imu_buffer_size_, 2000);
+  dlio::declare_param(this, "odom/deskew/maxLookback", this->deskew_max_lookback_, 0.5);
 
   std::vector<double> accel_default{0., 0., 0.}; std::vector<double> prior_accel_bias;
   std::vector<double> gyro_default{0., 0., 0.}; std::vector<double> prior_gyro_bias;
@@ -1587,8 +1866,16 @@ void dlio::OdomNode::getParams() {
                       this->use_degeneracy_, true);
   dlio::declare_param(this, "odom/gicp/degeneracy/trans_eig_abs_threshold",
                       this->degen_trans_eig_abs_thresh_, 200.0);
-  dlio::declare_param(this, "odom/gicp/degeneracy/reset_consecutive_count",
-                      this->degen_reset_consecutive_count_, 5);
+  dlio::declare_param(this, "odom/gicp/degeneracy/recovery_time",
+                      this->degen_recovery_time_, 3.0);
+  dlio::declare_param(this, "odom/gicp/degeneracy/max_linear_speed",
+                      this->degen_max_linear_speed_, 8.0);
+  dlio::declare_param(this, "odom/gicp/degeneracy/max_angular_speed",
+                      this->degen_max_angular_speed_, 4.0);
+  dlio::declare_param(this, "odom/gicp/degeneracy/max_accel_bias",
+                      this->degen_max_accel_bias_, 5.0);
+  dlio::declare_param(this, "odom/gicp/degeneracy/max_gyro_bias",
+                      this->degen_max_gyro_bias_, 0.5);
 
   // Restart geometry gate: after a reset, incoming scans are checked via
   // local-normal diversity before the system re-initializes. Scans that fail
@@ -1627,10 +1914,35 @@ void dlio::OdomNode::getParams() {
                 "odom/gicp/degeneracy/trans_eig_abs_threshold must be >= 0. Clamping to 0.");
     this->degen_trans_eig_abs_thresh_ = 0.0;
   }
-  if (this->degen_reset_consecutive_count_ < 0) {
+  if (this->deskew_max_lookback_ <= 0.0) {
     RCLCPP_WARN(this->get_logger(),
-                "odom/gicp/degeneracy/reset_consecutive_count must be >= 0. Clamping to 0.");
-    this->degen_reset_consecutive_count_ = 0;
+                "odom/deskew/maxLookback must be > 0. Clamping to 0.5 s.");
+    this->deskew_max_lookback_ = 0.5;
+  }
+  if (this->degen_recovery_time_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/gicp/degeneracy/recovery_time must be > 0. Clamping to 3.0 s.");
+    this->degen_recovery_time_ = 3.0;
+  }
+  if (this->degen_max_linear_speed_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/gicp/degeneracy/max_linear_speed must be > 0. Clamping to 8.0 m/s.");
+    this->degen_max_linear_speed_ = 8.0;
+  }
+  if (this->degen_max_angular_speed_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/gicp/degeneracy/max_angular_speed must be > 0. Clamping to 4.0 rad/s.");
+    this->degen_max_angular_speed_ = 4.0;
+  }
+  if (this->degen_max_accel_bias_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/gicp/degeneracy/max_accel_bias must be > 0. Clamping to 5.0 m/s^2.");
+    this->degen_max_accel_bias_ = 5.0;
+  }
+  if (this->degen_max_gyro_bias_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/gicp/degeneracy/max_gyro_bias must be > 0. Clamping to 0.5 rad/s.");
+    this->degen_max_gyro_bias_ = 0.5;
   }
   if (this->viz_degen_trans_scale_ <= 0.0) {
     RCLCPP_WARN(this->get_logger(), "viz/degeneracy_marker/trans_scale must be > 0. Clamping to 0.75.");
@@ -1675,6 +1987,10 @@ void dlio::OdomNode::publishToROS(
     const Eigen::Vector3f& state_vlin_b_scan,
     const Eigen::Vector3f& state_vang_b_scan)
 {
+  if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   // Build an exact scan-time timestamp once and use it everywhere below.
   const uint64_t nsec = static_cast<uint64_t>(scanStamp * 1e9);
   builtin_interfaces::msg::Time scan_stamp_msg;
@@ -1868,6 +2184,10 @@ void dlio::OdomNode::publishCloud(
     const Eigen::Ref<const Eigen::Matrix4f>& T_map_odom,
     const rclcpp::Time& cloud_stamp)
 {
+  if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   if (this->wait_until_move_ && this->length_traversed < 0.1) {
     return;
   }
@@ -1946,6 +2266,10 @@ void dlio::OdomNode::publishCloud(
 void dlio::OdomNode::publishKeyframe(
     std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>, pcl::PointCloud<PointType>::ConstPtr> kf,
     rclcpp::Time timestamp) {
+
+  if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+    return;
+  }
 
   // Push back
   geometry_msgs::msg::Pose p;
@@ -2145,6 +2469,12 @@ void dlio::OdomNode::preprocessPoints() {
 
 void dlio::OdomNode::deskewPointcloud() {
 
+  // Establish a valid scan_stamp up front. Several early returns below leave
+  // without reaching the per-point timestamp extraction; if scan_stamp kept the
+  // previous scan's value, prev_scan_stamp would freeze and every later sweep
+  // would query a progressively staler IMU interval.
+  this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
+
   if (!this->original_scan || this->original_scan->empty()) {
     this->deskewed_scan = std::make_shared<const pcl::PointCloud<PointType>>();
     this->deskew_status = false;
@@ -2313,35 +2643,59 @@ void dlio::OdomNode::deskewPointcloud() {
     scan_anchor = this->scan_state;
   }
 
-  // IMU prior & deskewing for second scan onwards
+  // IMU prior & deskewing for second scan onwards.
+  //
+  // The integration normally starts at prev_scan_stamp, anchored on the last
+  // registered LiDAR pose. That anchor is only usable while prev_scan_stamp is
+  // recent and still covered by the IMU ring buffer. After a degeneracy halt,
+  // a restart, or any dropped scan, it can be far behind -- integrateImu() then
+  // returns an empty vector and, because the anchor never moves on its own,
+  // every subsequent sweep fails the same way. Detect that case and re-anchor
+  // the sweep at its own start using the predicted scan state instead.
+  const double oldest_imu_stamp = this->oldestImuStamp();
+  double integration_start = this->prev_scan_stamp;
+  Eigen::Quaternionf anchor_q = this->lidarPose.q;
+  Eigen::Vector3f anchor_p = this->lidarPose.p;
+
+  const char* reanchor_reason = nullptr;
+  if (!std::isfinite(integration_start) || integration_start <= 0.0) {
+    reanchor_reason = "anchor not initialized";
+  } else if (integration_start > timestamps.front()) {
+    reanchor_reason = "anchor is newer than the sweep start";
+  } else if (timestamps.front() - integration_start > this->deskew_max_lookback_) {
+    reanchor_reason = "anchor is older than the maximum deskew lookback";
+  } else if (oldest_imu_stamp >= 0.0 && integration_start <= oldest_imu_stamp) {
+    reanchor_reason = "anchor predates the oldest buffered IMU sample";
+  }
+
+  if (reanchor_reason != nullptr) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Deskew re-anchored at the sweep start (%s): prev_scan_stamp=%.6f "
+      "sweep=[%.6f, %.6f] oldest_imu=%.6f.",
+      reanchor_reason, this->prev_scan_stamp,
+      timestamps.front(), timestamps.back(), oldest_imu_stamp);
+
+    integration_start = timestamps.front();
+    anchor_q = scan_anchor.q;
+    anchor_p = scan_anchor.p;
+  }
+
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
-  frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
+  frames = this->integrateImu(integration_start, anchor_q, anchor_p,
                               scan_anchor.v.lin.w, timestamps, scan_anchor.b);
   this->deskew_size = static_cast<int>(frames.size()); // if integration successful, equal to timestamps.size()
 
   // if there are no frames between the start and end of the sweep
   // that probably means that there's a sync issue
   if (frames.size() != timestamps.size()) {
-    // clang-format off
-    std::cerr
-      << "\033[1;41m\033[1;37m"
-      << "\n"
-      << "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  \n"
-      << "  !!                                                                            !!  \n"
-      << "  !!   DESKEW FAILED: integrateImu returned " << std::setw(5) << frames.size()
-                                    << " frames for " << std::setw(5) << timestamps.size() << " points   !!  \n"
-      << "  !!   Scan will be published WITHOUT per-point motion compensation.            !!  \n"
-      << "  !!   Likely cause: IMU buffer gap or bad LiDAR/IMU time sync.                !!  \n"
-      << "  !!   prev_scan_stamp=" << std::fixed << std::setprecision(6) << this->prev_scan_stamp
-                         << "  scan_end=" << timestamps.back() << "                          !!  \n"
-      << "  !!                                                                            !!  \n"
-      << "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!  \n"
-      << "\033[0m\n";
-    // clang-format on
-    RCLCPP_FATAL(this->get_logger(),
-      "DESKEW FAILED: integrateImu got %zu frames for %zu point timestamps "
-      "(prev_scan_stamp=%.6f scan_end=%.6f). Scan published at T_prior without deskewing.",
-      frames.size(), timestamps.size(), this->prev_scan_stamp, timestamps.back());
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 2000,
+      "Deskew unavailable: integrateImu returned %zu/%zu frames "
+      "(start=%.6f sweep=[%.6f, %.6f] oldest_imu=%.6f). "
+      "Using T_prior without per-point compensation.",
+      frames.size(), timestamps.size(), integration_start,
+      timestamps.front(), timestamps.back(), oldest_imu_stamp);
 
     this->T_prior = this->T;
     pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
@@ -2508,6 +2862,11 @@ void dlio::OdomNode::resetPointCloudTiming() {
 
 void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
 
+  if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+    this->processHaltedScan(pc);
+    return;
+  }
+
   std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
   this->main_loop_running = true;
   lock.unlock();
@@ -2528,6 +2887,13 @@ void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::Shar
 
   // Convert incoming scan into DLIO format
   this->getScanFromROS(pc);
+
+  // Single owner of the deskew anchor: whichever way this function returns, the
+  // scan that was just consumed becomes the new prev_scan_stamp. Without this
+  // the early-return paths below (too few points, degenerate initial scan,
+  // rejected pose) leave the anchor behind, and the gap it has to cover grows
+  // with every dropped scan until it no longer fits the IMU ring buffer.
+  const auto scan_stamp_guard = makeScopeExit([this]() { this->advancePrevScanStamp(); });
 
   if (!this->original_scan || this->original_scan->empty()) {
     lock.lock();
@@ -2570,8 +2936,34 @@ void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::Shar
 
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
+    if (this->use_degeneracy_) {
+      this->analyzeDegeneracyFromCurrentScan(this->T_prior);
+      this->publishDegeneracyMarkers(this->scan_header_stamp);
+
+      State initial_candidate;
+      {
+        std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
+        initial_candidate = this->scan_state_prior_valid_ ? this->scan_state_prior : this->state;
+      }
+
+      std::string reason;
+      const bool initial_degenerate = this->currentScanIsDegenerate(initial_candidate, reason);
+      this->publishDegeneracyStatus(initial_degenerate);
+      if (initial_degenerate) {
+        ++this->degen_consecutive_hits_;
+        this->enterDegenerateHalt("initial scan: " + reason);
+        lock.lock();
+        this->main_loop_running = false;
+        lock.unlock();
+        this->submap_build_cv.notify_one();
+        return;
+      }
+    }
+
     this->initializeInputTarget();
-    this->publishDegeneracyStatus(false);
+    if (!this->use_degeneracy_) {
+      this->publishDegeneracyStatus(false);
+    }
     State initial_scan_state;
     {
       std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
@@ -2588,6 +2980,12 @@ void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::Shar
 
   // Get the next pose via IMU + S2M + GEO
   if (!this->getNextPose()) {
+    // scan_stamp_guard advances the deskew anchor past this rejected scan, so a
+    // halt cannot leave recovery asking for a multi-second stale IMU interval.
+    lock.lock();
+    this->main_loop_running = false;
+    lock.unlock();
+    this->submap_build_cv.notify_one();
     return;
   }
 
@@ -2889,7 +3287,8 @@ void dlio::OdomNode::callbackImu(sensor_msgs::msg::Imu::SharedPtr imu_raw) {
     // Notify the callbackPointCloud thread that IMU data exists for this time
     this->cv_imu_stamp.notify_one();
 
-    if (integration_timing.dt_seconds.has_value() && this->propagateState(this->imu_meas)) {
+    if (!this->estimator_halted_.load(std::memory_order_relaxed) &&
+        integration_timing.dt_seconds.has_value() && this->propagateState(this->imu_meas)) {
       this->publishPoseSnapshot();
     }
 
@@ -2898,6 +3297,10 @@ void dlio::OdomNode::callbackImu(sensor_msgs::msg::Imu::SharedPtr imu_raw) {
 }
 
 void dlio::OdomNode::publishPoseSnapshot() {
+  if (this->estimator_halted_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
   Eigen::Vector3f p = Eigen::Vector3f::Zero();
   Eigen::Vector3f vlin_b = Eigen::Vector3f::Zero();
   Eigen::Vector3f vang_b = Eigen::Vector3f::Zero();
@@ -2914,6 +3317,26 @@ void dlio::OdomNode::publishPoseSnapshot() {
   }
 
   q.normalize();
+
+  if (this->use_degeneracy_) {
+    State live_snapshot;
+    live_snapshot.p = p;
+    live_snapshot.q = q;
+    live_snapshot.v.lin.w = q.toRotationMatrix() * vlin_b;
+    live_snapshot.v.lin.b = vlin_b;
+    live_snapshot.v.ang.b = vang_b;
+    live_snapshot.v.ang.w = q.toRotationMatrix() * vang_b;
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      live_snapshot.b = this->state.b;
+    }
+    std::string reason;
+    if (this->stateExceedsDegeneracyBounds(live_snapshot, reason)) {
+      this->enterDegenerateHalt("IMU propagation: " + reason);
+      this->publishDegeneracyStatus(true);
+      return;
+    }
+  }
 
   // Build and publish Odometry (dlio_odom -> base_link)
   // twist is expressed in child frame (base_link), so use body-frame velocities directly.
@@ -3477,32 +3900,34 @@ bool dlio::OdomNode::getNextPose() {
     this->analyzeDegeneracyFromCurrentScan(this->T_prior);
     this->publishDegeneracyMarkers(this->scan_header_stamp);
 
-    live_degenerate = this->degen_info_.valid &&
-                      hasWeakDirection(this->degen_info_.weak_trans);
-    if (live_degenerate) {
-      this->gicp_rematch_trials_latched_ = true;
-      this->gicp_freeze_trials_latched_ = false;
+    State scan_candidate;
+    State live_candidate;
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      scan_candidate = this->scan_state_prior_valid_ ? this->scan_state_prior : this->state;
+      live_candidate = this->state;
+    }
+
+    std::string degeneracy_reason;
+    live_degenerate = this->currentScanIsDegenerate(scan_candidate, degeneracy_reason);
+    if (!live_degenerate) {
+      std::string live_reason;
+      if (this->stateExceedsDegeneracyBounds(live_candidate, live_reason)) {
+        live_degenerate = true;
+        degeneracy_reason = "live " + live_reason;
+      }
     }
 
     if (live_degenerate) {
+      this->gicp_rematch_trials_latched_ = true;
+      this->gicp_freeze_trials_latched_ = false;
       ++this->degen_consecutive_hits_;
-
-      if (this->degen_reset_consecutive_count_ > 0) {
-        RCLCPP_WARN(this->get_logger(),
-                    "[DEGEN] Consecutive live degeneracy detections: %d/%d",
-                    this->degen_consecutive_hits_,
-                    this->degen_reset_consecutive_count_);
-      }
-
-      if (this->degen_reset_consecutive_count_ > 0 &&
-          this->degen_consecutive_hits_ >= this->degen_reset_consecutive_count_) {
-        std::ostringstream reason;
-        reason << "live scan degeneracy detected for "
-               << this->degen_consecutive_hits_ << " consecutive scans";
-        if (this->triggerInternalReset(reason.str())) {
-          return false;
-        }
-      }
+      RCLCPP_WARN(this->get_logger(),
+                  "[DEGEN] Scan rejected immediately (%d consecutive detections): %s",
+                  this->degen_consecutive_hits_, degeneracy_reason.c_str());
+      this->enterDegenerateHalt(degeneracy_reason);
+      this->publishDegeneracyStatus(true);
+      return false;
     } else {
       this->degen_consecutive_hits_ = 0;
     }
@@ -3558,6 +3983,22 @@ bool dlio::OdomNode::getNextPose() {
 
   // Geometric observer update using LiDAR registration result
   this->updateState();
+
+  // The observer/GICP update itself can drive speed or bias beyond safe bounds.
+  // Check the corrected state before processPointCloud can enqueue or publish it.
+  if (this->use_degeneracy_) {
+    State corrected_state;
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      corrected_state = this->state;
+    }
+    std::string reason;
+    if (this->stateExceedsDegeneracyBounds(corrected_state, reason)) {
+      this->enterDegenerateHalt("post-update: " + reason);
+      this->publishDegeneracyStatus(true);
+      return false;
+    }
+  }
 
   return true;
 }
@@ -3935,7 +4376,19 @@ void dlio::OdomNode::updateState() {
 
   Eigen::Vector3f pin = this->lidarPose.p;
   Eigen::Quaternionf qin = this->lidarPose.q;
-  const double dt = this->scan_stamp - this->prev_scan_stamp;
+
+  double dt = this->scan_stamp - this->prev_scan_stamp;
+  const double dt_max =
+      this->pointcloud_expected_period_ + this->pointcloud_period_tolerance_;
+  if (!std::isfinite(dt) || dt <= 0.0 || dt > dt_max) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Observer step out of range (scan=%.6f prev_scan=%.6f dt=%.6f s, max %.6f s); "
+        "using the nominal LiDAR period %.6f s.",
+        this->scan_stamp, this->prev_scan_stamp, dt, dt_max,
+        this->pointcloud_expected_period_);
+    dt = this->pointcloud_expected_period_;
+  }
   const float dtf = static_cast<float>(dt);
 
   Eigen::Quaternionf qe, qhat, qcorr;

@@ -87,6 +87,15 @@ private:
   bool triggerInternalReset(const std::string& reason);
   void requestMapReset(const std::string& origin);
   bool scanPassesGeometryGate(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
+  void processHaltedScan(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
+  void advancePrevScanStamp();
+  double oldestImuStamp();
+  bool stateExceedsDegeneracyBounds(const State& candidate,
+                                    std::string& reason) const;
+  bool currentScanGeometryIsDegenerate(std::string& reason) const;
+  bool currentScanIsDegenerate(const State& candidate,
+                               std::string& reason) const;
+  void enterDegenerateHalt(const std::string& reason);
   std::size_t filterPointCloudByRingRange(sensor_msgs::msg::PointCloud2& pc);
   bool shouldStop();
 
@@ -571,8 +580,18 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   // raw scan normal-spread matrix.
   bool   use_degeneracy_ = false;
   double degen_trans_eig_abs_thresh_ = 200.0;
-  int    degen_reset_consecutive_count_ = 5;
   int    degen_consecutive_hits_ = 0;
+  double degen_recovery_time_ = 3.0;
+  double degen_max_linear_speed_ = 8.0;
+  double degen_max_angular_speed_ = 4.0;
+  double degen_max_accel_bias_ = 5.0;
+  double degen_max_gyro_bias_ = 0.5;
+  double degen_recovery_start_stamp_ = 0.0;
+  // Largest interval deskewPointcloud() may ask integrateImu() to cover. Beyond
+  // this the prior anchored at prev_scan_stamp is meaningless anyway, so the
+  // sweep is re-anchored at its own start instead of failing.
+  double deskew_max_lookback_ = 0.5;
+  std::atomic_bool estimator_halted_{false};
   bool   gicp_freeze_trials_latched_ = false;
   bool   gicp_rematch_trials_latched_ = false;
 

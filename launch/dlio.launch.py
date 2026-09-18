@@ -26,7 +26,7 @@ def generate_launch_description():
     # Nodes
     dlio_odom_node = Node(
         package='direct_lidar_inertial_odometry',
-        executable='dlio_odom_node',
+        executable='dlio_odom_node',The fix. A third AbsoluteUnaryAlignmentRecoveryPolicy — ReinitializeFromCurrentGuess — that throws the stale belief away and re-initializes from the fresh geometric guess instead:
         output='screen',
         parameters=[dlio_yaml_path, dlio_params_yaml_path, {'use_sim_time': use_sim_time}],
         remappings=[
