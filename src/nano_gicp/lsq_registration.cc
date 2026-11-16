@@ -296,9 +296,10 @@ bool LsqRegistration<PointTarget, PointSource>::step_lm(Eigen::Isometry3d& x0,
       continue;
     }
 
-    // Predicted reduction (standard LM): pred = -dᵀ b - 0.5 dᵀ H d
+    // Predicted reduction of the cost sum(e'Me) with b = J'Me and H = J'MJ: pred = -(2 dᵀ b + dᵀ H d).
+    // (The former -dᵀ b - 0.5 dᵀ H d was half of it, so the gain ratio rho came out 2x too large.)
     const double Hd = (H * d).dot(d);
-    const double pred = -d.dot(b) - 0.5 * Hd;
+    const double pred = -2.0 * d.dot(b) - Hd;
 
     double rho = -1.0;
     if (std::isfinite(pred) && pred > 0.0) {

@@ -160,12 +160,21 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
       const std::optional<double>& dt);
 
   void updateKeyframes();
-  void computeConvexHull();
-  void computeConcaveHull();
+  void computeConvexHull(const pcl::PointCloud<PointType>::ConstPtr& keyframe_positions);
+  void computeConcaveHull(const pcl::PointCloud<PointType>::ConstPtr& keyframe_positions);
   void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames);
   void buildSubmap(const State& vehicle_state);
   void buildKeyframesAndSubmap(const State& vehicle_state);
   void pauseSubmapBuildIfNeeded();
+  void applyExternalOdomSeed();
+
+  // Gravity seen by the IMU over [t_end - window, t_end]: mean specific force in the body frame of the last sample
+  // <= t_end, every sample rotated into that frame with the gyro (minus gyro_bias). Works while driving: the robot's
+  // rotation is removed, what remains besides gravity is the net acceleration over the window (dv / window).
+  bool imuGravityWindow(double t_end, double window, const Eigen::Vector3f& gyro_bias,
+                        Eigen::Vector3f& f_mean, std::string& reject_reason);
+  // Pulls roll/pitch of the registered pose (and so of new keyframes / the map) toward the IMU gravity direction.
+  void applyGravityTiltCorrection(double scan_dt);
 
   void publishPoseSnapshot();
   void onKeyframesTrim(std::size_t removed);
@@ -294,18 +303,22 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
 
   // Keyframes
   pcl::PointCloud<PointType>::ConstPtr keyframe_cloud;
-  int num_processed_keyframes;
+  int num_processed_keyframes;  // guarded by keyframes_mutex
+  // Keyframes trimmed from the front since the last reset (guarded by keyframes_mutex). Absolute keyframe ID = index + this.
+  std::size_t keyframes_removed_total_ = 0;
 
   pcl::ConvexHull<PointType> convex_hull;
   pcl::ConcaveHull<PointType> concave_hull;
-  std::vector<int> keyframe_convex;
-  std::vector<int> keyframe_concave;
+  std::vector<int> keyframe_convex;   // submap thread only: indices into buildSubmap()'s keyframe snapshot
+  std::vector<int> keyframe_concave;  // submap thread only: indices into buildSubmap()'s keyframe snapshot
+  std::atomic<double> concave_hull_alpha_{1.0};  // set by the scan thread (adaptive), applied by the submap thread
 
   // Submap
   pcl::PointCloud<PointType>::ConstPtr submap_cloud;
   std::shared_ptr<const nano_gicp::CovarianceList> submap_normals;
   std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> submap_kdtree;
 
+  // Submap thread only (performReset touches them after joining it): absolute keyframe IDs, stable across trims
   std::vector<int> submap_kf_idx_curr;
   std::vector<int> submap_kf_idx_prev;
 
@@ -457,8 +470,11 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   // External odometry (replaces IMU for initialization and T_prior in sim mode)
   Pose externalOdomPose;
   Pose prevExternalOdomPose;
-  bool first_external_odom_received;
+  std::atomic<bool> first_external_odom_received;
   std::mutex mtx_external_odom;
+  // First external pose, handed from callbackExternalOdom to the scan thread, which owns this->T (guarded by mtx_external_odom)
+  bool external_odom_seed_pending_ = false;
+  Eigen::Matrix4f external_odom_seed_T_ = Eigen::Matrix4f::Identity();
 
   // Metrics
   struct Metrics {
@@ -587,6 +603,43 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   double degen_max_accel_bias_ = 5.0;
   double degen_max_gyro_bias_ = 0.5;
   double degen_recovery_start_stamp_ = 0.0;
+
+  // Gravity from the IMU window (odom/gravity/*)
+  double gravity_window_ = 3.0;                    // [s] gyro-compensated accelerometer window
+  double gravity_max_gap_ = 0.05;                  // [s] largest IMU sample gap inside the window
+  bool   gravity_restart_from_imu_ = false;        // restart attitude from the window instead of the start-up gravity
+  double gravity_restart_max_norm_dev_ = 1.0;      // [m/s^2] accept the restart window if ||f|-g| below this
+  bool   gravity_correction_enabled_ = false;      // continuous roll/pitch pull of the registered pose toward gravity
+  double gravity_correction_time_constant_ = 2.0;  // [s] gain per scan = scan period / time constant
+  double gravity_correction_max_norm_dev_ = 0.3;   // [m/s^2] skip windows whose |f| differs from g by more than this
+  // The window mean of the specific force is g + mean kinematic acceleration = g + (v_end - v_start) / window, which includes
+  // the centripetal part of turns and is invisible to the |f| check. It is subtracted (world frame, from the scan-state
+  // velocity history); windows whose mean acceleration exceeds this are skipped.
+  double gravity_correction_max_acc_ = 0.3;  // [m/s^2]
+  std::deque<std::pair<double, Eigen::Vector3f>> gravity_vel_hist_;  // (scan stamp, world velocity), scan thread only
+  double gravity_correction_max_step_deg_ = 0.5;   // [deg] largest correction per scan
+  // correction statistics (scan thread), logged every 10 s
+  int    gravity_corr_applied_ = 0;
+  int    gravity_corr_rejected_window_ = 0;
+  int    gravity_corr_rejected_accel_ = 0;
+  double gravity_corr_tilt_sum_deg_ = 0.0;
+  double gravity_corr_tilt_max_deg_ = 0.0;
+  double gravity_corr_last_log_stamp_ = 0.0;
+
+  // GICP correction diagnostics and gate (odom/gicp/correctionGate/*). Correction = registered pose vs IMU prior.
+  bool   gicp_gate_enabled_ = false;
+  double gicp_gate_max_translation_ = 0.5;     // [m] per scan
+  double gicp_gate_max_rotation_deg_ = 3.0;    // [deg] per scan
+  int    gicp_gate_max_consecutive_ = 20;      // rejected scans in a row before halting
+  int    gicp_gate_consecutive_ = 0;
+  bool   gicp_correction_rejected_ = false;    // this scan: no keyframe update
+  std::vector<float> gicp_corr_trans_hist_;    // per-scan |correction| since the last diagnostics line
+  std::vector<float> gicp_corr_weak_hist_;     // |correction| along the weakest scan direction
+  float  gicp_corr_rot_max_deg_ = 0.f;
+  double gicp_corr_min_eig_ = 1e12;
+  int    gicp_corr_rejected_count_ = 0;
+  double gicp_corr_last_log_stamp_ = 0.0;
+  void gateAndLogGicpCorrection();
   // Largest interval deskewPointcloud() may ask integrateImu() to cover. Beyond
   // this the prior anchored at prev_scan_stamp is meaningless anyway, so the
   // sweep is re-anchored at its own start instead of failing.
@@ -599,6 +652,12 @@ void publishCloud(const pcl::PointCloud<PointType>::ConstPtr& cloud,
   // local-normal scatter matrix.
   bool   restart_gate_enabled_ = true;
   double restart_gate_min_eigenvalue_ = 50.0;
+  // Restart: velocity re-estimated from the first registrations after a reset (updateState), scan thread only
+  static constexpr int kRestartVelocityScans = 3;  // registrations after the anchor scan that set the velocity
+  int restart_vel_scans_left_ = 0;
+  bool restart_vel_have_anchor_ = false;
+  Eigen::Vector3f restart_vel_anchor_p_ = Eigen::Vector3f::Zero();
+  double restart_vel_anchor_t_ = 0.0;
 
   bool   viz_degen_marker_ = true;
   double viz_degen_trans_scale_ = 0.75;

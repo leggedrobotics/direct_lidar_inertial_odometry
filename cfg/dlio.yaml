@@ -19,8 +19,11 @@
 
     adaptive/spaciousness/min: 0.25
     adaptive/spaciousness/max: 4.0
-    adaptive/density/factor_min: 0.5
-    adaptive/density/factor_max: 2.0
+    # GICP correspondence distance = factor_min (confined) / factor_max (open, median range > spaciousness/max) x
+    # odom/gicp/maxCorrespondenceDistance. 1.0/1.0: the configured distance as is (2.0 in open terrain gave more jumps,
+    # worse horizontal accuracy and +50 % CPU at Katzensee, 2026-11-10).
+    adaptive/density/factor_min: 1.0
+    adaptive/density/factor_max: 1.0
 
     pointcloud/deskew: true
     pointcloud/voxelize: true

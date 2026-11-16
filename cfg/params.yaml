@@ -49,9 +49,11 @@
     # 10% NIST ranges; rings run lowest-to-highest (ring 0 = chart channel 32).
     odom/preprocessing/ringRangeFilter/enabled: true
     odom/preprocessing/ringRangeFilter/maxRanges: [10.0, 20.0, 20.0, 20.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
-    odom/preprocessing/voxelFilter/res: 0.1
+    # Registration voxel. The published dense map uses the full deskewed scan (map/dense/filtered: false), so this does not
+    # thin the map. 0.1 m gave ~5x more along-track GICP jumps on open terrain than 0.25 m (Katzensee, 2026-11-10).
+    odom/preprocessing/voxelFilter/res: 0.25
 
-    odom/keyframe/threshD: 10.25
+    odom/keyframe/threshD: 1.0   # [m] only used with adaptive: false (adaptive sets it from the median scan range, 0.25-4 m)
     odom/keyframe/threshR: 10.0
 
     odom/submap/keyframe/knn: 10
@@ -60,7 +62,7 @@
 
     odom/gicp/minNumPoints: 128
     odom/gicp/kCorrespondences: 21
-    odom/gicp/maxCorrespondenceDistance: 0.5
+    odom/gicp/maxCorrespondenceDistance: 0.25   # [m] used as is (adaptive/density factors are 1.0 in dlio.yaml)
     odom/gicp/maxIterations: 64
 
     odom/gicp/transformationEpsilon: 0.005
@@ -68,8 +70,17 @@
 
     odom/gicp/initLambdaFactor: 1e-6
     odom/gicp/freezeTrialTriggerTranslation: 0.10
+    # Correction gate: a GICP correction larger than this w.r.t. the IMU prediction (normal: < 0.1 m) is physically
+    # implausible for one scan; the scan keeps the IMU prediction, adds no keyframe and gives the observer no kick.
+    odom/gicp/correctionGate/enabled: true
+    odom/gicp/correctionGate/maxTranslation: 0.5   # [m]
+    odom/gicp/correctionGate/maxRotationDeg: 3.0
+    odom/gicp/correctionGate/maxConsecutive: 20
     odom/gicp/degeneracy/enabled: true
-    odom/gicp/degeneracy/trans_eig_abs_threshold: 100.0
+    # The normal-scatter eigenvalues below are sums over the registration points, so they scale with the voxel size.
+    # Values for voxel 0.25 (voxel 0.1 used 100 / 250): replaying the halt logic on the per-scan eigenvalues of 8 datasets,
+    # 45 / 120 reproduces the voxel 0.1 halts best (2026-11-11).
+    odom/gicp/degeneracy/trans_eig_abs_threshold: 45.0
     odom/gicp/degeneracy/recovery_time: 3.0
     odom/gicp/degeneracy/max_linear_speed: 8.0
     odom/gicp/degeneracy/max_angular_speed: 4.0
@@ -77,16 +88,33 @@
     odom/gicp/degeneracy/max_gyro_bias: 0.5
 
     odom/restart/geometry_gate/enabled: true
-    odom/restart/geometry_gate/min_eigenvalue: 250.0
+    odom/restart/geometry_gate/min_eigenvalue: 120.0
 
-    # Aggressive (wn=3.0, zeta=0.85): Kp=5.1, Kv=9.0, Kq=12.0, Kab=3.0, Kgb=1.5
-    odom/geo/Kp: 5.1
-    odom/geo/Kv: 11.25
+    # Geometric observer. Position/velocity error dynamics s^2 + Kp s + Kv = 0: wn = sqrt(Kv), zeta = Kp / (2 wn).
+    # 2026-11-10 (Katzensee): critically damped wn 2.13 rad/s (was Kp 5.1 / Kv 11.25: wn 3.35, zeta 0.76), slower bias
+    # learning (was Kab 2.25 / Kgb 1.0) and bias limits ~2x the largest healthy bias (was 5 m/s^2 / 0.5 rad/s, which let one
+    # bad registration drive the accel bias to ~1 m/s^2). With the correction gate: 0 jumps instead of ~350 in 12.5 min.
+    odom/geo/Kp: 4.25
+    odom/geo/Kv: 4.52
     odom/geo/Kq: 4.0
-    odom/geo/Kab: 2.25
-    odom/geo/Kgb: 1.0
-    odom/geo/abias_max: 5.0
-    odom/geo/gbias_max: 0.5
+    odom/geo/Kab: 0.5
+    odom/geo/Kgb: 0.25
+    odom/geo/abias_max: 0.4    # [m/s^2] per axis; healthy |b_a| 0.13-0.19
+    odom/geo/gbias_max: 0.02   # [rad/s] per axis; healthy |b_g| 0.002-0.005
+
+    # Gravity from the IMU: gyro-compensated accelerometer window (works while driving).
+    # restartFromImu: restart attitude from the window instead of the start-up gravity direction.
+    # correction: pull roll/pitch of the registered pose (and so the map) toward gravity; gain/scan = period / timeConstant.
+    # Katzensee 2026-11-09: DLIO vertical error through the D5 outage +75 m -> +0.9 m (tau 0.2 s); tau 2 s is too weak.
+    odom/gravity/window: 3.0
+    odom/gravity/maxGap: 0.05
+    odom/gravity/restartFromImu: true
+    odom/gravity/restartMaxNormDeviation: 1.0
+    odom/gravity/correction/enabled: true
+    odom/gravity/correction/timeConstant: 0.2
+    odom/gravity/correction/maxAcceleration: 0.3   # [m/s^2] the window's mean kinematic acceleration is subtracted; above this the window is skipped
+    odom/gravity/correction/maxNormDeviation: 0.3
+    odom/gravity/correction/maxStepDeg: 0.5
 
     # Visualization (velocity markers)
     viz/vel_marker/enabled: true

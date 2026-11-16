@@ -1,6 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
+from launch.actions import OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -13,22 +14,28 @@ def generate_launch_description():
     pointcloud_topic = LaunchConfiguration('pointcloud_topic', default='/lidar/point_cloud')
     imu_topic = LaunchConfiguration('imu_topic', default='/imu_sensor_broadcaster/imu')
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
+    extra_params_file = LaunchConfiguration('extra_params_file', default='')
 
     declare_rviz_arg = DeclareLaunchArgument('rviz', default_value=rviz, description='Launch RViz')
     declare_pointcloud_topic_arg = DeclareLaunchArgument('pointcloud_topic', default_value=pointcloud_topic, description='Pointcloud topic name')
     declare_imu_topic_arg = DeclareLaunchArgument('imu_topic', default_value=imu_topic, description='IMU topic name')
     declare_use_sim_time_arg = DeclareLaunchArgument('use_sim_time', default_value=use_sim_time, description='Use /clock (sim time)')
+    declare_extra_params_file_arg = DeclareLaunchArgument(
+        'extra_params_file', default_value=extra_params_file,
+        description='Optional parameter file loaded last (overrides cfg/dlio.yaml and cfg/params.yaml)')
 
     # Params
     dlio_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml'])
     dlio_params_yaml_path = PathJoinSubstitution([current_pkg, 'cfg', 'params.yaml'])
 
-    # Nodes
-    dlio_odom_node = Node(
+    # Nodes (odom node built at launch time so that an optional extra parameter file can be appended)
+    def make_odom_node(context):
+      extra = extra_params_file.perform(context).strip()
+      return [Node(
         package='direct_lidar_inertial_odometry',
         executable='dlio_odom_node',
         output='screen',
-        parameters=[dlio_yaml_path, dlio_params_yaml_path, {'use_sim_time': use_sim_time}],
+        parameters=[dlio_yaml_path, dlio_params_yaml_path, {'use_sim_time': use_sim_time}] + ([extra] if extra else []),
         remappings=[
             ('pointcloud', pointcloud_topic),
             ('imu', imu_topic),
@@ -51,7 +58,9 @@ def generate_launch_description():
             ('degenerate', 'dlio/odom_node/degenerate'),
         ],
         respawn=True,
-    )
+      )]
+
+    dlio_odom_node = OpaqueFunction(function=make_odom_node)
 
     # DLIO Mapping Node
     dlio_map_node = Node(
@@ -82,6 +91,7 @@ def generate_launch_description():
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
         declare_use_sim_time_arg,
+        declare_extra_params_file_arg,
         dlio_odom_node,
         dlio_map_node,
         rviz_node

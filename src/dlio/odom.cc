@@ -319,6 +319,7 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
   this->concave_hull.setAlpha(this->keyframe_thresh_dist_);
+  this->concave_hull_alpha_.store(this->keyframe_thresh_dist_);
   this->concave_hull.setKeepInformation(true);
 
   this->gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
@@ -677,6 +678,54 @@ void dlio::OdomNode::performReset() {
   this->q_cv_.notify_all();
 
   // -----------------------------------------------------------------------
+  // Restart attitude from the IMU, BEFORE the buffer is cleared. The robot is
+  // usually driving here and DLIO's own attitude is diverged, so neither the
+  // pre-halt state nor a plain accelerometer mean is usable; the IMU kept
+  // buffering while halted, and the gyro-compensated window measures gravity
+  // in the current body frame to ~1 deg in motion (Katzensee: p95 1.3 deg vs
+  // 8.3 deg for the start-up attitude). Yaw stays arbitrary (new map).
+  // -----------------------------------------------------------------------
+  bool restart_gravity_from_imu = false;
+  Eigen::Vector3f restart_gravity_body = Eigen::Vector3f::Zero();
+  if (this->gravity_restart_from_imu_ && this->initial_imu_baseline_.valid) {
+    double newest_stamp = -1.0;
+    {
+      std::lock_guard<decltype(this->mtx_imu)> lk(this->mtx_imu);
+      if (!this->imu_buffer.empty()) {
+        newest_stamp = this->imu_buffer.front().stamp;
+      }
+    }
+    Eigen::Vector3f f_mean;
+    std::string reason = "empty IMU buffer";
+    if (newest_stamp > 0.0 &&
+        this->imuGravityWindow(newest_stamp, this->gravity_window_, this->initial_imu_baseline_.gyro_bias,
+                               f_mean, reason)) {
+      const Eigen::Vector3f g_body = f_mean - this->initial_imu_baseline_.accel_bias;
+      const double g_norm = (this->initial_imu_baseline_.gravity_norm > 1e-6f)
+          ? static_cast<double>(this->initial_imu_baseline_.gravity_norm) : std::abs(this->gravity_);
+      const double dev = std::abs(static_cast<double>(g_body.norm()) - g_norm);
+      if (dev <= this->gravity_restart_max_norm_dev_) {
+        restart_gravity_from_imu = true;
+        restart_gravity_body = g_body;
+        const Eigen::Vector3f startup_dir = this->initial_imu_baseline_.gravity_vec.normalized();
+        const double vs_startup_deg = std::acos(std::clamp(
+            static_cast<double>(g_body.normalized().dot(startup_dir)), -1.0, 1.0)) * 180.0 / M_PI;
+        RCLCPP_INFO(this->get_logger(),
+                    "[RESET] Attitude from the IMU gravity window (%.2f s ending %.3f): ||f|-g| %.3f m/s^2, "
+                    "%.2f deg away from the start-up gravity direction.",
+                    this->gravity_window_, newest_stamp, dev, vs_startup_deg);
+      } else {
+        reason = "||f|-g| = " + std::to_string(dev) + " m/s^2 (net acceleration)";
+      }
+    }
+    if (!restart_gravity_from_imu) {
+      RCLCPP_WARN(this->get_logger(),
+                  "[RESET] IMU gravity window rejected (%s); restarting from the start-up gravity direction.",
+                  reason.c_str());
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // IMU buffer and IMU-tracking state
   // -----------------------------------------------------------------------
   {
@@ -696,10 +745,16 @@ void dlio::OdomNode::performReset() {
   {
     std::unique_lock<std::mutex> lock(this->mtx_external_odom);
     this->first_external_odom_received = false;
+    this->external_odom_seed_pending_ = false;
     this->externalOdomPose.p    = Eigen::Vector3f::Zero();
     this->externalOdomPose.q    = Eigen::Quaternionf::Identity();
     this->prevExternalOdomPose  = this->externalOdomPose;
   }
+  this->gravity_vel_hist_.clear();  // velocities of the old map frame
+  // The robot usually keeps moving through a restart, but the state velocity is frozen at the halt (stale by the whole
+  // halt). Restart from zero and re-estimate it from the first registrations instead (updateState).
+  this->restart_vel_scans_left_ = kRestartVelocityScans;
+  this->restart_vel_have_anchor_ = false;
   RCLCPP_INFO(this->get_logger(), "[RESET] IMU buffer cleared, IMU stamps zeroed, external odom state reset.");
 
   // -----------------------------------------------------------------------
@@ -718,6 +773,9 @@ void dlio::OdomNode::performReset() {
     reset_gravity_vec = Eigen::Vector3f(0.f, 0.f, std::abs(gravity_scalar));
   } else {
     reset_gravity_vec = reset_gravity_vec.normalized() * gravity_norm;
+  }
+  if (restart_gravity_from_imu) {
+    reset_gravity_vec = restart_gravity_body.normalized() * gravity_norm;
   }
 
   Eigen::Quaternionf reset_gravity_align_q = this->initial_imu_baseline_.gravity_align_q;
@@ -783,8 +841,9 @@ void dlio::OdomNode::performReset() {
     this->keyframe_timestamps.clear();
     this->keyframe_normals.clear();
     this->keyframe_transformations.clear();
+    this->num_processed_keyframes = 0;
+    this->keyframes_removed_total_ = 0;
   }
-  this->num_processed_keyframes = 0;
   this->keyframe_convex.clear();
   this->keyframe_concave.clear();
   this->submap_kf_idx_curr.clear();
@@ -1789,6 +1848,21 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/imu/bufferSize", this->imu_buffer_size_, 2000);
   dlio::declare_param(this, "odom/deskew/maxLookback", this->deskew_max_lookback_, 0.5);
 
+  // Gravity from the IMU (gyro-compensated accelerometer window)
+  dlio::declare_param(this, "odom/gravity/window", this->gravity_window_, 3.0);
+  dlio::declare_param(this, "odom/gravity/maxGap", this->gravity_max_gap_, 0.05);
+  dlio::declare_param(this, "odom/gravity/restartFromImu", this->gravity_restart_from_imu_, false);
+  dlio::declare_param(this, "odom/gravity/restartMaxNormDeviation", this->gravity_restart_max_norm_dev_, 1.0);
+  dlio::declare_param(this, "odom/gravity/correction/enabled", this->gravity_correction_enabled_, false);
+  dlio::declare_param(this, "odom/gravity/correction/timeConstant", this->gravity_correction_time_constant_, 2.0);
+  dlio::declare_param(this, "odom/gravity/correction/maxNormDeviation", this->gravity_correction_max_norm_dev_, 0.3);
+  dlio::declare_param(this, "odom/gravity/correction/maxAcceleration", this->gravity_correction_max_acc_, 0.3);
+  dlio::declare_param(this, "odom/gravity/correction/maxStepDeg", this->gravity_correction_max_step_deg_, 0.5);
+  dlio::declare_param(this, "odom/gicp/correctionGate/enabled", this->gicp_gate_enabled_, false);
+  dlio::declare_param(this, "odom/gicp/correctionGate/maxTranslation", this->gicp_gate_max_translation_, 0.5);
+  dlio::declare_param(this, "odom/gicp/correctionGate/maxRotationDeg", this->gicp_gate_max_rotation_deg_, 3.0);
+  dlio::declare_param(this, "odom/gicp/correctionGate/maxConsecutive", this->gicp_gate_max_consecutive_, 20);
+
   std::vector<double> accel_default{0., 0., 0.}; std::vector<double> prior_accel_bias;
   std::vector<double> gyro_default{0., 0., 0.}; std::vector<double> prior_gyro_bias;
 
@@ -1834,9 +1908,9 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/geo/Kq",              this->geo_Kq_,              6.7);  // ~2/τq, τq≈0.30 s
   dlio::declare_param(this, "odom/geo/Kgb",             this->geo_Kgb_,             2.0);  // ~0.3–1.0 * c1; pick ~0.5*c1
 
-  // --- Translation layer (Eq. 15): Kp≈ω_n^2, Kv≈2ζω_n, Kab≈K1 ---
-  dlio::declare_param(this, "odom/geo/Kp",              this->geo_Kp_,              2.25); // ω_n≈1.5 s^-1  => ω_n^2
-  dlio::declare_param(this, "odom/geo/Kv",              this->geo_Kv_,              3.0);  // 2 ζ ω_n with ζ≈1
+  // --- Translation layer (Eq. 15): position/velocity error dynamics s^2 + Kp s + Kv = 0, i.e. Kv = ω_n^2, Kp = 2ζω_n ---
+  dlio::declare_param(this, "odom/geo/Kp",              this->geo_Kp_,              2.25); // 2 ζ ω_n
+  dlio::declare_param(this, "odom/geo/Kv",              this->geo_Kv_,              3.0);  // ω_n^2
   dlio::declare_param(this, "odom/geo/Kab",             this->geo_Kab_,             0.10); // conservative accel-bias adaption
 
   // --- Bias anti-windup clamps (pick from your IMU datasheet ranges) ---
@@ -1914,6 +1988,25 @@ void dlio::OdomNode::getParams() {
                 "odom/gicp/degeneracy/trans_eig_abs_threshold must be >= 0. Clamping to 0.");
     this->degen_trans_eig_abs_thresh_ = 0.0;
   }
+  if (this->gravity_window_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(), "odom/gravity/window must be > 0. Using 3.0 s.");
+    this->gravity_window_ = 3.0;
+  }
+  if (this->gravity_window_ > 0.8 * this->imu_buffer_size_ / 400.0) {
+    RCLCPP_WARN(this->get_logger(),
+                "odom/gravity/window %.2f s may exceed the IMU buffer (%d samples); windows will be rejected "
+                "if the buffer does not cover them.", this->gravity_window_, this->imu_buffer_size_);
+  }
+  if (this->gravity_correction_time_constant_ <= 0.0) {
+    RCLCPP_WARN(this->get_logger(), "odom/gravity/correction/timeConstant must be > 0. Disabling the correction.");
+    this->gravity_correction_enabled_ = false;
+  }
+  RCLCPP_INFO(this->get_logger(),
+              "Gravity from IMU: window %.2f s, restart attitude from IMU %s, roll/pitch correction %s "
+              "(time constant %.2f s, gate %.2f m/s^2, max step %.2f deg)",
+              this->gravity_window_, this->gravity_restart_from_imu_ ? "ON" : "off",
+              this->gravity_correction_enabled_ ? "ON" : "off", this->gravity_correction_time_constant_,
+              this->gravity_correction_max_norm_dev_, this->gravity_correction_max_step_deg_);
   if (this->deskew_max_lookback_ <= 0.0) {
     RCLCPP_WARN(this->get_logger(),
                 "odom/deskew/maxLookback must be > 0. Clamping to 0.5 s.");
@@ -2637,10 +2730,12 @@ void dlio::OdomNode::deskewPointcloud() {
   }
 
   (void)this->predictScanState(this->scan_stamp);
-  State scan_anchor;
+  State scan_anchor;        // corrected state of the previous scan, valid at prev_scan_stamp
+  State sweep_start_state;  // observer prediction at this sweep's start (scan_stamp == timestamps.front())
   {
     std::lock_guard<std::mutex> geo_lock(this->geo.mtx);
     scan_anchor = this->scan_state;
+    sweep_start_state = this->scan_state_prior;
   }
 
   // IMU prior & deskewing for second scan onwards.
@@ -2656,6 +2751,8 @@ void dlio::OdomNode::deskewPointcloud() {
   double integration_start = this->prev_scan_stamp;
   Eigen::Quaternionf anchor_q = this->lidarPose.q;
   Eigen::Vector3f anchor_p = this->lidarPose.p;
+  Eigen::Vector3f anchor_v = scan_anchor.v.lin.w;
+  ImuBias anchor_b = scan_anchor.b;
 
   const char* reanchor_reason = nullptr;
   if (!std::isfinite(integration_start) || integration_start <= 0.0) {
@@ -2676,14 +2773,21 @@ void dlio::OdomNode::deskewPointcloud() {
       reanchor_reason, this->prev_scan_stamp,
       timestamps.front(), timestamps.back(), oldest_imu_stamp);
 
+    // The anchor must be the state AT the sweep start: predictScanState() just propagated the
+    // last corrected state to scan_stamp (== timestamps.front()). scan_state itself is still the
+    // previous scan's state (older by the gap that triggered the re-anchor); using it here placed
+    // the whole sweep at the old pose. When the prediction failed, scan_state_prior falls back to
+    // scan_state, so this is never worse than before.
     integration_start = timestamps.front();
-    anchor_q = scan_anchor.q;
-    anchor_p = scan_anchor.p;
+    anchor_q = sweep_start_state.q;
+    anchor_p = sweep_start_state.p;
+    anchor_v = sweep_start_state.v.lin.w;
+    anchor_b = sweep_start_state.b;
   }
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
   frames = this->integrateImu(integration_start, anchor_q, anchor_p,
-                              scan_anchor.v.lin.w, timestamps, scan_anchor.b);
+                              anchor_v, timestamps, anchor_b);
   this->deskew_size = static_cast<int>(frames.size()); // if integration successful, equal to timestamps.size()
 
   // if there are no frames between the start and end of the sweep
@@ -2885,6 +2989,9 @@ void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::Shar
     this->initializeDLIO();
   }
 
+  // Install a pending external-odometry seed of this->T (scan thread owns T)
+  this->applyExternalOdomSeed();
+
   // Convert incoming scan into DLIO format
   this->getScanFromROS(pc);
 
@@ -3017,8 +3124,17 @@ void dlio::OdomNode::processPointCloud(const sensor_msgs::msg::PointCloud2::Shar
     this->has_T_map_odom_latest = true;
   }
 
+  // Velocity history for the gravity correction's acceleration compensation
+  this->gravity_vel_hist_.emplace_back(this->scan_stamp, scan_state_snapshot.v.lin.w);
+  while (!this->gravity_vel_hist_.empty() &&
+         this->gravity_vel_hist_.front().first < this->scan_stamp - this->gravity_window_ - 1.0) {
+    this->gravity_vel_hist_.pop_front();
+  }
+
   // Update current keyframe poses and map
-  this->updateKeyframes();
+  if (!this->gicp_correction_rejected_) {
+    this->updateKeyframes();
+  }
 
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
@@ -3975,6 +4091,36 @@ bool dlio::OdomNode::getNextPose() {
     this->gicp_hasConverged = false;
   }
 
+  this->gateAndLogGicpCorrection();
+  if (this->gicp_correction_rejected_ && this->gicp_gate_consecutive_ > this->gicp_gate_max_consecutive_) {
+    this->enterDegenerateHalt("GICP corrections implausible for " + std::to_string(this->gicp_gate_consecutive_) +
+                              " consecutive scans");
+    this->publishDegeneracyStatus(true);
+    this->gicp_gate_consecutive_ = 0;
+    return false;
+  }
+
+  if (this->gravity_correction_enabled_ && this->initial_imu_baseline_.valid) {
+    this->applyGravityTiltCorrection(this->pointcloud_expected_period_);
+    if (this->scan_stamp - this->gravity_corr_last_log_stamp_ >= 10.0 ||
+        this->scan_stamp < this->gravity_corr_last_log_stamp_) {
+      RCLCPP_INFO(
+          this->get_logger(),
+          "[GRAVITY] scan %.3f roll/pitch correction: %d applied, %d rejected (window), %d rejected (acceleration); "
+          "measured tilt mean %.2f deg, max %.2f deg",
+          this->scan_stamp, this->gravity_corr_applied_, this->gravity_corr_rejected_window_,
+          this->gravity_corr_rejected_accel_,
+          this->gravity_corr_applied_ > 0 ? this->gravity_corr_tilt_sum_deg_ / this->gravity_corr_applied_ : 0.0,
+          this->gravity_corr_tilt_max_deg_);
+      this->gravity_corr_last_log_stamp_ = this->scan_stamp;
+      this->gravity_corr_applied_ = 0;
+      this->gravity_corr_rejected_window_ = 0;
+      this->gravity_corr_rejected_accel_ = 0;
+      this->gravity_corr_tilt_sum_deg_ = 0.0;
+      this->gravity_corr_tilt_max_deg_ = 0.0;
+    }
+  }
+
   // this->computeMotionDeviation();
 
   // Update next global pose
@@ -4435,6 +4581,24 @@ void dlio::OdomNode::updateState() {
   corrected.p += dtf * kp * err;
   corrected.v.lin.w += dtf * kv * err;
 
+  // After a restart: velocity straight from the registered displacement since the first accepted registration (the
+  // observer alone needs ~1.5 s to pull it up from zero). Rejected scans carry the IMU prior, not a measurement.
+  if (this->restart_vel_scans_left_ > 0 && !this->gicp_correction_rejected_) {
+    if (!this->restart_vel_have_anchor_) {
+      this->restart_vel_anchor_p_ = pin;
+      this->restart_vel_anchor_t_ = this->scan_stamp;
+      this->restart_vel_have_anchor_ = true;
+    } else {
+      const double span = this->scan_stamp - this->restart_vel_anchor_t_;
+      if (span > 0.05 && span < 1.0) {
+        corrected.v.lin.w = (pin - this->restart_vel_anchor_p_) / static_cast<float>(span);
+        --this->restart_vel_scans_left_;
+      } else {
+        this->restart_vel_scans_left_ = 0;  // too far apart: leave it to the observer
+      }
+    }
+  }
+
   corrected.q.w() += dtf * kq * qcorr.w();
   corrected.q.x() += dtf * kq * qcorr.x();
   corrected.q.y() += dtf * kq * qcorr.y();
@@ -4604,28 +4768,19 @@ void dlio::OdomNode::computeDensity() {
 
 }
 
-void dlio::OdomNode::computeConvexHull() {
+// Submap thread only. keyframe_positions: snapshot of the processed keyframe positions taken by
+// buildSubmap(); the resulting indices refer to that snapshot.
+void dlio::OdomNode::computeConvexHull(const pcl::PointCloud<PointType>::ConstPtr& keyframe_positions) {
+
+  this->keyframe_convex.clear();
 
   // at least 4 keyframes for convex hull
-  if (this->num_processed_keyframes < 4) {
+  if (keyframe_positions->size() < 4) {
     return;
   }
 
-  // create a pointcloud with points at keyframes
-  pcl::PointCloud<PointType>::Ptr cloud = std::make_shared<pcl::PointCloud<PointType>>();
-
-  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
-  for (int i = 0; i < this->num_processed_keyframes; i++) {
-    PointType pt;
-    pt.x = this->keyframes[i].first.first[0];
-    pt.y = this->keyframes[i].first.first[1];
-    pt.z = this->keyframes[i].first.first[2];
-    cloud->push_back(pt);
-  }
-  lock.unlock();
-
   // calculate the convex hull of the point cloud
-  this->convex_hull.setInputCloud(cloud);
+  this->convex_hull.setInputCloud(keyframe_positions);
 
   // get the indices of the keyframes on the convex hull
   pcl::PointCloud<PointType>::Ptr convex_points = std::make_shared<pcl::PointCloud<PointType>>();
@@ -4634,35 +4789,26 @@ void dlio::OdomNode::computeConvexHull() {
   pcl::PointIndices::Ptr convex_hull_point_idx = std::make_shared<pcl::PointIndices>();
   this->convex_hull.getHullPointIndices(*convex_hull_point_idx);
 
-  this->keyframe_convex.clear();
   for (int i=0; i<convex_hull_point_idx->indices.size(); ++i) {
     this->keyframe_convex.push_back(convex_hull_point_idx->indices[i]);
   }
 
 }
 
-void dlio::OdomNode::computeConcaveHull() {
+// Submap thread only, see computeConvexHull().
+void dlio::OdomNode::computeConcaveHull(const pcl::PointCloud<PointType>::ConstPtr& keyframe_positions) {
+
+  this->keyframe_concave.clear();
 
   // at least 5 keyframes for concave hull
-  if (this->num_processed_keyframes < 5) {
+  if (keyframe_positions->size() < 5) {
     return;
   }
 
-  // create a pointcloud with points at keyframes
-  auto cloud = std::make_shared<pcl::PointCloud<PointType>>();
-
-  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
-  for (int i = 0; i < this->num_processed_keyframes; i++) {
-    PointType pt;
-    pt.x = this->keyframes[i].first.first[0];
-    pt.y = this->keyframes[i].first.first[1];
-    pt.z = this->keyframes[i].first.first[2];
-    cloud->push_back(pt);
-  }
-  lock.unlock();
-
-  // calculate the concave hull of the point cloud
-  this->concave_hull.setInputCloud(cloud);
+  // calculate the concave hull of the point cloud (alpha follows the adaptive keyframe distance,
+  // which the scan thread updates; setting it here keeps concave_hull private to this thread)
+  this->concave_hull.setAlpha(this->concave_hull_alpha_.load());
+  this->concave_hull.setInputCloud(keyframe_positions);
 
   // get the indices of the keyframes on the concave hull
   pcl::PointCloud<PointType>::Ptr concave_points = std::make_shared<pcl::PointCloud<PointType>>();
@@ -4671,7 +4817,6 @@ void dlio::OdomNode::computeConcaveHull() {
   pcl::PointIndices::Ptr concave_hull_point_idx = std::make_shared<pcl::PointIndices>();
   this->concave_hull.getHullPointIndices(*concave_hull_point_idx);
 
-  this->keyframe_concave.clear();
   for (int i=0; i<concave_hull_point_idx->indices.size(); ++i) {
     this->keyframe_concave.push_back(concave_hull_point_idx->indices[i]);
   }
@@ -4763,6 +4908,7 @@ void dlio::OdomNode::updateKeyframes() {
 
 }
 
+// Called from updateKeyframes() (scan thread) with keyframes_mutex held.
 void dlio::OdomNode::onKeyframesTrim(std::size_t removed) {
   if (removed == 0) return;
 
@@ -4770,47 +4916,30 @@ void dlio::OdomNode::onKeyframesTrim(std::size_t removed) {
   if (this->num_processed_keyframes <= removed) this->num_processed_keyframes = 0;
   else                                          this->num_processed_keyframes -= static_cast<int>(removed);
 
-  auto shift_down = [removed](std::vector<int>& idxs) {
-    const int r = static_cast<int>(removed);
-    int w = 0;
-    for (int i = 0; i < idxs.size(); ++i) {
-      const int v = idxs[i] - r;
-      if (v >= 0) idxs[w++] = v;    // keep only still-valid indices
-    }
-    idxs.resize(w);
-  };
-
-  shift_down(this->submap_kf_idx_prev);
-  shift_down(this->submap_kf_idx_curr);
-  shift_down(this->keyframe_convex);
-  shift_down(this->keyframe_concave);
+  // The submap thread refers to keyframes by absolute ID (index + keyframes_removed_total_), so a
+  // trim only advances the offset. It used to shift submap_kf_idx_*/keyframe_convex/_concave here,
+  // while buildSubmap() was clearing and filling the same vectors on the submap thread without a
+  // lock (data race on std::vector, and indices computed before the trim used after it).
+  this->keyframes_removed_total_ += removed;
 }
 
 void dlio::OdomNode::setAdaptiveParams() {
 
-  // Spaciousness
-  float sp = this->metrics.spaciousness.back();
-
-  if (sp < this->adaptive_sp_min_) { sp = this->adaptive_sp_min_; }
-  if (sp > this->adaptive_sp_max_) { sp = this->adaptive_sp_max_; }
-
+  // Spaciousness (low-passed median horizontal range of the scan) sets the keyframe distance.
+  const float sp_raw = this->metrics.spaciousness.back();
+  const float sp = std::min(std::max(sp_raw, static_cast<float>(this->adaptive_sp_min_)), static_cast<float>(this->adaptive_sp_max_));
   this->keyframe_thresh_dist_ = sp;
 
-  // Density
-  float den = this->metrics.density.back();
-  const float den_min = this->adaptive_den_factor_min_ * static_cast<float>(this->gicp_max_corr_dist_);
-  const float den_max = this->adaptive_den_factor_max_ * static_cast<float>(this->gicp_max_corr_dist_);
+  // GICP correspondence distance: factor_min x the configured distance in confined scenes, factor_max x in open ones
+  // (median range beyond spaciousness/max). Decided on the unclamped spaciousness; the previous code compared the clamped
+  // value (so the open-scene branch never fired) and clamped the density metric, a mean squared neighbour distance in m^2,
+  // against a distance, which pinned the correspondence distance at factor_min x the configured value.
+  const float corr_dist = static_cast<float>(this->gicp_max_corr_dist_) *
+      static_cast<float>(sp_raw > this->adaptive_sp_max_ ? this->adaptive_den_factor_max_ : this->adaptive_den_factor_min_);
+  this->gicp.setMaxCorrespondenceDistance(corr_dist);
 
-  if (den < den_min) { den = den_min; }
-  if (den > den_max) { den = den_max; }
-
-  if (sp < this->adaptive_sp_max_) { den = den_min; }
-  if (sp > this->adaptive_sp_max_) { den = den_max; }
-
-  this->gicp.setMaxCorrespondenceDistance(den);
-
-  // Concave hull alpha
-  this->concave_hull.setAlpha(this->keyframe_thresh_dist_);
+  // Concave hull alpha (applied by the submap thread in computeConcaveHull)
+  this->concave_hull_alpha_.store(this->keyframe_thresh_dist_);
 
 }
 
@@ -4846,28 +4975,45 @@ void dlio::OdomNode::pushSubmapIndices(std::vector<float> dists, int k, std::vec
 
 }
 
+// Runs on the submap thread while the scan thread keeps adding and trimming keyframes
+// (updateKeyframes / onKeyframesTrim). Shared keyframe data is read only under keyframes_mutex:
+// once as a snapshot for the selection, once to concatenate the chosen keyframes. Keyframes are
+// tracked by absolute ID (index + keyframes_removed_total_), which a trim in between does not
+// change. submap_kf_idx_* and keyframe_convex/_concave belong to this thread.
 void dlio::OdomNode::buildSubmap(const State& vehicle_state) {
 
   // clear vector of keyframe indices to use for submap
   this->submap_kf_idx_curr.clear();
 
-  // calculate distance between current pose and poses in keyframe set
-  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+  // snapshot: distance between current pose and the processed keyframes, and their positions
+  auto keyframe_positions = std::make_shared<pcl::PointCloud<PointType>>();
   std::vector<float> ds;
   std::vector<int> keyframe_nn;
-  for (int i = 0; i < this->num_processed_keyframes; i++) {
-    const Eigen::Vector3f delta = vehicle_state.p - this->keyframes[i].first.first;
-    const float d = delta.norm();
-    ds.push_back(d);
-    keyframe_nn.push_back(i);
+  std::size_t id_offset = 0;
+  {
+    std::lock_guard<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+    id_offset = this->keyframes_removed_total_;
+    const int n = std::min(this->num_processed_keyframes, static_cast<int>(this->keyframes.size()));
+    ds.reserve(n);
+    keyframe_nn.reserve(n);
+    keyframe_positions->reserve(n);
+    for (int i = 0; i < n; i++) {
+      const Eigen::Vector3f& kf_p = this->keyframes[i].first.first;
+      ds.push_back((vehicle_state.p - kf_p).norm());
+      keyframe_nn.push_back(i);
+      PointType pt;
+      pt.x = kf_p[0];
+      pt.y = kf_p[1];
+      pt.z = kf_p[2];
+      keyframe_positions->push_back(pt);
+    }
   }
-  lock.unlock();
 
   // get indices for top K nearest neighbor keyframe poses
   this->pushSubmapIndices(ds, this->submap_knn_, keyframe_nn);
 
   // get convex hull indices
-  this->computeConvexHull();
+  this->computeConvexHull(keyframe_positions);
 
   // get distances for each keyframe on convex hull
   std::vector<float> convex_ds;
@@ -4883,7 +5029,7 @@ void dlio::OdomNode::buildSubmap(const State& vehicle_state) {
   this->pushSubmapIndices(convex_ds, this->submap_kcv_, convex_frames);
 
   // get concave hull indices
-  this->computeConcaveHull();
+  this->computeConcaveHull(keyframe_positions);
 
   // get distances for each keyframe on concave hull
   std::vector<float> concave_ds;
@@ -4897,6 +5043,11 @@ void dlio::OdomNode::buildSubmap(const State& vehicle_state) {
 
   // get indices for top kNN for concave hull
   this->pushSubmapIndices(concave_ds, this->submap_kcc_, concave_frames);
+
+  // snapshot indices -> absolute keyframe IDs (comparable with submap_kf_idx_prev across trims)
+  for (auto& k : this->submap_kf_idx_curr) {
+    k += static_cast<int>(id_offset);
+  }
 
   // sort current and previous submap kf list of indices
   std::sort(this->submap_kf_idx_curr.begin(), this->submap_kf_idx_curr.end());
@@ -4920,9 +5071,15 @@ void dlio::OdomNode::buildSubmap(const State& vehicle_state) {
 
     {
       std::unique_lock<decltype(this->keyframes_mutex)> submap_lock(this->keyframes_mutex);
-      for (auto k : this->submap_kf_idx_curr) {
-        if (k < 0 || k >= static_cast<int>(this->keyframes.size()) ||
-            k >= static_cast<int>(this->keyframe_normals.size())) {
+      // resolve the IDs against the current front offset: keyframes trimmed since the snapshot are
+      // skipped (the next build sees the changed set and rebuilds), the rest are the same keyframes
+      const long long offset_now = static_cast<long long>(this->keyframes_removed_total_);
+      const long long n_now = std::min({static_cast<long long>(this->num_processed_keyframes),
+                                        static_cast<long long>(this->keyframes.size()),
+                                        static_cast<long long>(this->keyframe_normals.size())});
+      for (auto id : this->submap_kf_idx_curr) {
+        const long long k = static_cast<long long>(id) - offset_now;
+        if (k < 0 || k >= n_now) {
           continue;
         }
 
@@ -4983,6 +5140,207 @@ void dlio::OdomNode::buildKeyframesAndSubmap(const State& vehicle_state) {
   this->buildSubmap(vehicle_state);
 }
 
+bool dlio::OdomNode::imuGravityWindow(double t_end, double window, const Eigen::Vector3f& gyro_bias,
+                                      Eigen::Vector3f& f_mean, std::string& reject_reason) {
+  // Newest-first copy of the samples covering [t_end - window, t_end] (imu_buffer front = newest)
+  std::vector<ImuMeas> samples;
+  {
+    std::lock_guard<decltype(this->mtx_imu)> lock(this->mtx_imu);
+    samples.reserve(static_cast<std::size_t>(window * 500.0) + 8);
+    for (const auto& m : this->imu_buffer) {
+      if (m.stamp > t_end) {
+        continue;
+      }
+      samples.push_back(m);
+      if (m.stamp <= t_end - window) {
+        break;
+      }
+    }
+  }
+  if (samples.size() < 2) {
+    reject_reason = "no IMU samples";
+    return false;
+  }
+
+  // C = rotation from the body frame of the current (older) sample to the body frame at the window end.
+  // R_newer = R_older * Exp(w dt)  =>  C_older = C_newer * Exp(-w dt). Trapezoidal average of C f over time.
+  Eigen::Matrix3f C = Eigen::Matrix3f::Identity();
+  Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+  double covered = 0.0;
+  for (std::size_t k = 0; k + 1 < samples.size(); ++k) {
+    const ImuMeas& newer = samples[k];
+    const ImuMeas& older = samples[k + 1];
+    const double dt = newer.stamp - older.stamp;
+    if (!(dt > 0.0) || dt > this->gravity_max_gap_) {
+      reject_reason = "IMU gap of " + std::to_string(dt) + " s";
+      return false;
+    }
+    const float dtf = static_cast<float>(dt);
+    sum += 0.5f * dtf * (C * newer.lin_accel);
+    const Eigen::Vector3f w = 0.5f * (newer.ang_vel + older.ang_vel) - gyro_bias;
+    const float angle = w.norm() * dtf;
+    if (angle > 1e-9f) {
+      C = C * Eigen::AngleAxisf(-angle, w.normalized()).toRotationMatrix();
+    }
+    sum += 0.5f * dtf * (C * older.lin_accel);
+    covered += dt;
+  }
+  if (covered < 0.9 * window) {
+    reject_reason = "window covers only " + std::to_string(covered) + " s";
+    return false;
+  }
+  f_mean = sum / static_cast<float>(covered);
+  if (!f_mean.allFinite()) {
+    reject_reason = "non-finite mean";
+    return false;
+  }
+  return true;
+}
+
+void dlio::OdomNode::applyGravityTiltCorrection(double scan_dt) {
+  // Why the registered pose and not the observer state: keyframes (= the map) are stored at the GICP pose, and GICP
+  // keeps every scan consistent with that map. Without an absolute reference its roll/pitch drift is never undone.
+  // Each scan's pose is rotated a little toward gravity (about the robot position, roll/pitch only); new keyframes
+  // carry the correction, so the map levels out as old keyframes are replaced.
+  //
+  // Gravity reference: gyro-compensated accelerometer window ending at the scan, minus the start-up accel bias
+  // (constant, body-fixed). Not minus the observer's live accel bias: that bias is driven by the position error and
+  // absorbs exactly the tilt this corrects.
+  Eigen::Vector3f gyro_bias;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    gyro_bias = this->state.b.gyro;
+  }
+  Eigen::Vector3f f_mean;
+  std::string reason;
+  if (!this->imuGravityWindow(this->scan_stamp, this->gravity_window_, gyro_bias, f_mean, reason)) {
+    ++this->gravity_corr_rejected_window_;
+    return;
+  }
+  const Eigen::Vector3f g_body = f_mean - this->initial_imu_baseline_.accel_bias;
+  const double g_norm = (this->initial_imu_baseline_.gravity_norm > 1e-6f)
+      ? static_cast<double>(this->initial_imu_baseline_.gravity_norm) : std::abs(this->gravity_);
+  if (std::abs(static_cast<double>(g_body.norm()) - g_norm) > this->gravity_correction_max_norm_dev_) {
+    ++this->gravity_corr_rejected_accel_;
+    return;
+  }
+
+  const Eigen::Matrix3f R = this->T.block<3, 3>(0, 0);
+  const Eigen::Vector3f p = this->T.block<3, 1>(0, 3);
+  const Eigen::Vector3f up(0.f, 0.f, this->gravity_ < 0.0 ? -1.f : 1.f);
+  // Remove the mean kinematic acceleration over the window (start/stop, turns) using the scan-state velocities at both ends.
+  if (this->gravity_vel_hist_.size() < 2) {
+    ++this->gravity_corr_rejected_accel_;
+    return;
+  }
+  const auto& vel_end = this->gravity_vel_hist_.back();
+  const double t_start = vel_end.first - this->gravity_window_;
+  const auto vel_start = std::min_element(
+      this->gravity_vel_hist_.begin(), this->gravity_vel_hist_.end(),
+      [t_start](const auto& a, const auto& b) { return std::abs(a.first - t_start) < std::abs(b.first - t_start); });
+  const double vel_span = vel_end.first - vel_start->first;
+  if (vel_span < 0.5 * this->gravity_window_ || std::abs(vel_start->first - t_start) > 0.3) {
+    ++this->gravity_corr_rejected_accel_;
+    return;
+  }
+  const Eigen::Vector3f a_mean = (vel_end.second - vel_start->second) / static_cast<float>(vel_span);
+  if (a_mean.norm() > this->gravity_correction_max_acc_) {
+    ++this->gravity_corr_rejected_accel_;
+    return;
+  }
+  const Eigen::Vector3f measured_up = (R * g_body - a_mean).normalized();
+  const Eigen::Vector3f axis = measured_up.cross(up);  // horizontal: no yaw change
+  const double tilt = std::atan2(static_cast<double>(axis.norm()), static_cast<double>(measured_up.dot(up)));
+  ++this->gravity_corr_applied_;
+  this->gravity_corr_tilt_sum_deg_ += tilt * 180.0 / M_PI;
+  this->gravity_corr_tilt_max_deg_ = std::max(this->gravity_corr_tilt_max_deg_, tilt * 180.0 / M_PI);
+  if (axis.norm() < 1e-9f) {
+    return;
+  }
+  const double gain = std::min(1.0, scan_dt / this->gravity_correction_time_constant_);
+  const double step = std::min(gain * tilt, this->gravity_correction_max_step_deg_ * M_PI / 180.0);
+
+  Eigen::Matrix4f D = Eigen::Matrix4f::Identity();
+  const Eigen::Matrix3f Rd = Eigen::AngleAxisf(static_cast<float>(step), axis.normalized()).toRotationMatrix();
+  D.block<3, 3>(0, 0) = Rd;
+  D.block<3, 1>(0, 3) = p - Rd * p;
+  // T = T_corr * T_prior and the keyframe cloud is stored as T_corr * (scan in prior frame): rotate both.
+  this->T = D * this->T;
+  this->T_corr = D * this->T_corr;
+}
+
+// Correction of the registered pose relative to the IMU prior. Logs its distribution every 10 s of scan time and,
+// if the gate is enabled, rejects physically implausible corrections (scan-to-map slips along weakly constrained
+// directions, e.g. 1.5 m backwards in one scan while driving at 1 m/s): the pose stays on the IMU prior (observer
+// error 0 -> pure propagation) and the scan does not become a keyframe.
+void dlio::OdomNode::gateAndLogGicpCorrection() {
+  this->gicp_correction_rejected_ = false;
+  const Eigen::Vector3f dt = this->T.block<3, 1>(0, 3) - this->T_prior.block<3, 1>(0, 3);
+  const Eigen::Matrix3f dR = this->T_prior.block<3, 3>(0, 0).transpose() * this->T.block<3, 3>(0, 0);
+  const double rot_deg = Eigen::AngleAxisf(dR).angle() * 180.0 / M_PI;
+  float weak = 0.f;
+  if (this->degen_info_.valid) {
+    weak = std::abs(dt.cast<double>().dot(this->degen_info_.eigvecs_trans_map.col(0)));
+    this->gicp_corr_min_eig_ = std::min(this->gicp_corr_min_eig_, this->degen_info_.eigvals_trans_dec(0));
+  }
+  this->gicp_corr_trans_hist_.push_back(dt.norm());
+  this->gicp_corr_weak_hist_.push_back(weak);
+  this->gicp_corr_rot_max_deg_ = std::max(this->gicp_corr_rot_max_deg_, static_cast<float>(rot_deg));
+
+  if (this->gicp_gate_enabled_ &&
+      (dt.norm() > this->gicp_gate_max_translation_ || rot_deg > this->gicp_gate_max_rotation_deg_)) {
+    this->gicp_correction_rejected_ = true;
+    ++this->gicp_gate_consecutive_;
+    ++this->gicp_corr_rejected_count_;
+    RCLCPP_WARN(this->get_logger(),
+                "[GICP gate] scan %.3f correction %.2f m (%.2f m along the weakest direction, eig %.0f), %.2f deg "
+                "rejected (%d in a row); keeping the IMU prior.",
+                this->scan_stamp, dt.norm(), weak, this->degen_info_.valid ? this->degen_info_.eigvals_trans_dec(0) : -1.0,
+                rot_deg, this->gicp_gate_consecutive_);
+    this->T = this->T_prior;
+    this->T_corr = Eigen::Matrix4f::Identity();
+  } else {
+    this->gicp_gate_consecutive_ = 0;
+    if (dt.norm() > 0.3) {
+      RCLCPP_WARN(this->get_logger(),
+                  "[GICP diag] scan %.3f large correction %.2f m (%.2f m along the weakest direction, eig %.0f), %.2f deg",
+                  this->scan_stamp, dt.norm(), weak,
+                  this->degen_info_.valid ? this->degen_info_.eigvals_trans_dec(0) : -1.0, rot_deg);
+    }
+  }
+
+  if (this->scan_stamp - this->gicp_corr_last_log_stamp_ >= 10.0 || this->scan_stamp < this->gicp_corr_last_log_stamp_) {
+    auto pct = [](std::vector<float> v, double q) {
+      if (v.empty()) return 0.f;
+      const std::size_t k = std::min(v.size() - 1, static_cast<std::size_t>(q * (v.size() - 1) + 0.5));
+      std::nth_element(v.begin(), v.begin() + k, v.end());
+      return v[k];
+    };
+    RCLCPP_INFO(this->get_logger(),
+                "[GICP diag] scan %.3f, %zu scans: correction p50 %.3f p95 %.3f max %.3f m, weakest-direction p95 %.3f "
+                "max %.3f m, rotation max %.2f deg, min eig %.0f, rejected %d",
+                this->scan_stamp, this->gicp_corr_trans_hist_.size(), pct(this->gicp_corr_trans_hist_, 0.5),
+                pct(this->gicp_corr_trans_hist_, 0.95), pct(this->gicp_corr_trans_hist_, 1.0),
+                pct(this->gicp_corr_weak_hist_, 0.95), pct(this->gicp_corr_weak_hist_, 1.0), this->gicp_corr_rot_max_deg_,
+                this->gicp_corr_min_eig_ < 1e11 ? this->gicp_corr_min_eig_ : -1.0, this->gicp_corr_rejected_count_);
+    this->gicp_corr_last_log_stamp_ = this->scan_stamp;
+    this->gicp_corr_trans_hist_.clear();
+    this->gicp_corr_weak_hist_.clear();
+    this->gicp_corr_rot_max_deg_ = 0.f;
+    this->gicp_corr_min_eig_ = 1e12;
+    this->gicp_corr_rejected_count_ = 0;
+  }
+}
+
+void dlio::OdomNode::applyExternalOdomSeed() {
+  std::lock_guard<std::mutex> lock(this->mtx_external_odom);
+  if (!this->external_odom_seed_pending_) {
+    return;
+  }
+  this->T = this->external_odom_seed_T_;
+  this->external_odom_seed_pending_ = false;
+}
+
 void dlio::OdomNode::pauseSubmapBuildIfNeeded() {
   std::unique_lock<decltype(this->main_loop_running_mutex)> lock(this->main_loop_running_mutex);
   this->submap_build_cv.wait(lock, [this]{ return !this->main_loop_running || this->shouldStop(); });
@@ -4999,6 +5357,13 @@ void dlio::OdomNode::debug() {
 
   // length_traversed is already maintained incrementally in processPointCloud().
   const double length_traversed = this->length_traversed;
+
+  // debug() runs asynchronously; the keyframe vector is changed by the scan thread
+  std::size_t num_keyframes = 0;
+  {
+    std::lock_guard<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+    num_keyframes = this->keyframes.size();
+  }
 
   // Snapshot comp_times under lock to avoid racing with processPointCloud().
   std::vector<double> comp_snapshot;
@@ -5133,7 +5498,7 @@ void dlio::OdomNode::debug() {
                                        pow(this->state.p[2]-this->origin[2],2)), 4) + " meters"
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Registration       :: keyframes: " + std::to_string(this->keyframes.size()) + ", "
+    << "Registration       :: keyframes: " + std::to_string(num_keyframes) + ", "
                                + "deskewed points: " + std::to_string(this->deskew_size)
     << "|" << std::endl;
   std::cout << "|                                                                   |" << std::endl;
@@ -5181,9 +5546,12 @@ void dlio::OdomNode::callbackExternalOdom(nav_msgs::msg::Odometry::SharedPtr odo
 
   if (!this->first_external_odom_received) {
     // Seed DLIO's world pose from the absolute Gazebo ground-truth pose on first message.
-    this->T = Eigen::Matrix4f::Identity();
-    this->T.block<3,3>(0,0) = this->externalOdomPose.q.toRotationMatrix();
-    this->T.block<3,1>(0,3) = this->externalOdomPose.p;
+    // this->T belongs to the scan thread (this callback has its own group on the multi-threaded
+    // executor), so hand the seed over; applyExternalOdomSeed() installs it before the next scan.
+    this->external_odom_seed_T_ = Eigen::Matrix4f::Identity();
+    this->external_odom_seed_T_.block<3,3>(0,0) = this->externalOdomPose.q.toRotationMatrix();
+    this->external_odom_seed_T_.block<3,1>(0,3) = this->externalOdomPose.p;
+    this->external_odom_seed_pending_ = true;
 
     this->prevExternalOdomPose = this->externalOdomPose;
     this->first_external_odom_received = true;
