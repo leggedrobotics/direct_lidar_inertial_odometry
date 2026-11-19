@@ -60,7 +60,6 @@ add_library(nanoflann STATIC
   src/nano_gicp/nanoflann.cc
 )
 target_link_libraries(nanoflann ${PCL_LIBRARIES})
-ament_target_dependencies(nanoflann)
 
 add_library(nano_gicp STATIC
   src/nano_gicp/lsq_registration.cc
@@ -73,7 +72,6 @@ if(OpenMP_CXX_FOUND)
 else()
   target_link_libraries(nano_gicp ${PCL_LIBRARIES} nanoflann)
 endif()
-ament_target_dependencies(nano_gicp)
 
 # --- Executables ---
 add_executable(dlio_odom_node
@@ -85,8 +83,13 @@ if(OpenMP_CXX_FOUND)
 else()
   target_link_libraries(dlio_odom_node ${PCL_LIBRARIES} Threads::Threads nano_gicp)
 endif()
-ament_target_dependencies(dlio_odom_node
-  tf2_ros pcl_ros nav_msgs pcl_conversions rclcpp sensor_msgs geometry_msgs
+# Plain target_link_libraries instead of ament_target_dependencies, which
+# ROS 2 Lyrical removed. pcl_conversions exports targets only from Lyrical on;
+# on Jazzy its include-dir variable carries it (the other is then empty).
+target_include_directories(dlio_odom_node PRIVATE ${pcl_conversions_INCLUDE_DIRS})
+target_link_libraries(dlio_odom_node
+  tf2_ros::tf2_ros ${pcl_ros_TARGETS} ${nav_msgs_TARGETS} ${pcl_conversions_TARGETS}
+  rclcpp::rclcpp ${sensor_msgs_TARGETS} ${geometry_msgs_TARGETS}
 )
 
 add_executable(dlio_map_node
@@ -94,8 +97,9 @@ add_executable(dlio_map_node
   src/dlio/map.cc
 )
 target_link_libraries(dlio_map_node ${PCL_LIBRARIES} ${cpp_typesupport_target})
-ament_target_dependencies(dlio_map_node
-  tf2_ros pcl_ros pcl_conversions rclcpp
+target_include_directories(dlio_map_node PRIVATE ${pcl_conversions_INCLUDE_DIRS})
+target_link_libraries(dlio_map_node
+  tf2_ros::tf2_ros ${pcl_ros_TARGETS} ${pcl_conversions_TARGETS} rclcpp::rclcpp
 )
 
 # --- Export & install headers ---
