@@ -71,12 +71,19 @@ def generate_launch_description():
     #   orientation, so it only needs the robot to be still, not level.
     imu_bias_calibration = LaunchConfiguration('imu_bias_calibration', default='true')
     gravity_align = LaunchConfiguration('gravity_align', default='true')
+    # Simulation with /clock (e.g. a slowed-down MuJoCo): the nodes take ROS time from /clock.
+    use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     declare_imu_bias_calibration_arg = DeclareLaunchArgument(
         'imu_bias_calibration',
         default_value='true',
         description='Estimate gyro/accel biases from the first seconds of data. '
                     'Requires a stationary robot; harmful on a bias-free '
                     'simulated IMU.'
+    )
+    declare_use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Take ROS time from /clock (simulation).'
     )
     declare_gravity_align_arg = DeclareLaunchArgument(
         'gravity_align',
@@ -104,6 +111,7 @@ def generate_launch_description():
                 "frames/lidar": lidar_frame,
                 "frames/imu": imu_frame,
                 "frames/publish_sensor_tf": True,
+                "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
                 # last entry wins over the yaml above
                 "odom/imu/calibration/gyro": ParameterValue(
                     imu_bias_calibration, value_type=bool),
@@ -139,6 +147,7 @@ def generate_launch_description():
             dlio_params_yaml_path,
             {
                 "odom/odom_frame": odom_frame,
+                "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
             },
         ],
         remappings=[
@@ -159,6 +168,7 @@ def generate_launch_description():
         declare_imu_frame_arg,
         declare_imu_bias_calibration_arg,
         declare_gravity_align_arg,
+        declare_use_sim_time_arg,
         # 2) Nodes
         dlio_odom_node,
         dlio_map_node,
